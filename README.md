@@ -31,7 +31,7 @@ Go-GitSync is a novel decentralized file synchronization tool built in Go. It le
 1.  **Clone the repository:**
 
     ```bash
-    git clone git@github.com:<your-username>/gitsync.git  # Replace with your repository URL
+    git clone git@github.com:jmendick/gitsync.git  # Replace with your repository URL
     cd gitsync
     ```
 

@@ -3,7 +3,7 @@ package conflict
 import (
 	"fmt"
 
-	"github.com/your-username/gitsync/internal/model" // Replace with your project path
+	"github.com/jmendick/gitsync/internal/model" // Replace with your project path
 )
 
 // ConflictResolver handles synchronization conflicts.

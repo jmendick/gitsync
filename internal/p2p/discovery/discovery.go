@@ -3,8 +3,8 @@ package discovery
 import (
 	"fmt"
 
-	"github.com/your-username/gitsync/internal/config" // Replace with your project path
-	"github.com/your-username/gitsync/internal/model"       // Replace with your project path
+	"github.com/jmendick/gitsync/internal/config" // Replace with your project path
+	"github.com/jmendick/gitsync/internal/model"       // Replace with your project path
 )
 
 // DiscoveryService handles peer discovery.

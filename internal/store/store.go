@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/your-username/gitsync/internal/model" // Replace with your project path
+	"github.com/jmendick/gitsync/internal/model" // Replace with your project path
 )
 
 // StoreManager manages data persistence for gitsync.

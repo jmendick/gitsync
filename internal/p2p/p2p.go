@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/your-username/gitsync/internal/config" // Replace with your project path
-	"github.com/your-username/gitsync/internal/p2p/discovery" // Replace with your project path
-	"github.com/your-username/gitsync/internal/p2p/protocol"  // Replace with your project path
-	"github.com/your-username/gitsync/internal/model"       // Replace with your project path
+	"github.com/jmendick/gitsync/internal/config" // Replace with your project path
+	"github.com/jmendick/gitsync/internal/p2p/discovery" // Replace with your project path
+	"github.com/jmendick/gitsync/internal/p2p/protocol"  // Replace with your project path
+	"github.com/jmendick/gitsync/internal/model"       // Replace with your project path
 )
 
 // Node represents the P2P node.
