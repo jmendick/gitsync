@@ -1,0 +1,87 @@
+# Go-GitSync Example Configuration
+# Copy this file to config.yaml and modify as needed
+
+# Network listening address
+listen_address: ":8080"
+
+# Directory to store Git repositories
+repository_dir: "./gitsync-repos"
+
+# List of bootstrap peers for initial network discovery
+bootstrap_peers:
+  - "peer1.example.com:8080"
+  - "peer2.example.com:8080"
+
+# Security configuration
+security:
+  # Enable end-to-end encryption between peers
+  enable_encryption: false
+  # Authentication mode: none, tls, shared_key
+  auth_mode: "none"
+  # TLS certificate files (required if auth_mode is tls)
+  tls_cert_file: ""
+  tls_key_file: ""
+  # List of trusted peer IDs (optional)
+  trusted_peers: []
+
+# Network topology preferences
+network:
+  # Maximum number of connected peers
+  max_peers: 50
+  # Minimum number of connected peers
+  min_peers: 5
+  # Time before considering a peer connection timed out
+  peer_timeout: "5m"
+  # Preferred network zones for peer selection
+  preferred_zones: []
+  # Network topology mode: mesh, star, hierarchical
+  network_mode: "mesh"
+  # Connection strategy: aggressive, conservative
+  connection_strategy: "conservative"
+  # Bandwidth limit in bytes per second (0 = unlimited)
+  bandwidth_limit: 0
+
+# Synchronization configuration
+sync:
+  # Interval between automatic synchronization attempts
+  sync_interval: "5m"
+  # Maximum number of sync retries before giving up
+  max_sync_attempts: 3
+  # Sync mode: full, incremental, selective
+  sync_mode: "incremental"
+  # How to handle conflicts: manual, auto-resolve, prefer-local, prefer-remote
+  conflict_strategy: "manual"
+  # Enable automatic synchronization
+  auto_sync_enabled: true
+  # Patterns to exclude from synchronization
+  exclude_patterns:
+    - "*.tmp"
+    - ".git/"
+  # Patterns to include in synchronization (takes precedence over excludes)
+  include_patterns: []
+  # Number of files to sync in one batch
+  batch_size: 100
+
+# Merge preferences
+merge:
+  # Default merge strategy: ours, theirs, union, manual
+  default_strategy: "manual"
+  # Automatically resolve non-conflicting changes
+  auto_resolve: false
+  # Ignore whitespace changes in merges
+  ignore_whitespace: true
+  # Prefer upstream changes in automatic resolution
+  prefer_upstream: false
+  # Custom merge tools to use (paths)
+  custom_merge_tools: []
+
+# Peer discovery persistence
+discovery:
+  # Enable persistent storage of peer information
+  persistence_enabled: true
+  # Directory to store peer information
+  storage_dir: "./peer-cache"
+  # How long to keep peer information in cache
+  peer_cache_time: "24h"
+  # Maximum number of peers to store in cache
+  max_stored_peers: 1000

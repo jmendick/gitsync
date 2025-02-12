@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,7 +15,71 @@ type Config struct {
 	ListenAddress  string   `yaml:"listen_address"`
 	BootstrapPeers []string `yaml:"bootstrap_peers"`
 	RepositoryDir  string   `yaml:"repository_dir"`
-	// ... other configuration options ...
+
+	// Security settings
+	Security SecurityConfig `yaml:"security"`
+
+	// Network topology preferences
+	Network NetworkConfig `yaml:"network"`
+
+	// Sync strategy configuration
+	Sync SyncConfig `yaml:"sync"`
+
+	// Merge preferences
+	Merge MergeConfig `yaml:"merge"`
+
+	// Discovery persistence
+	Discovery DiscoveryConfig `yaml:"discovery"`
+}
+
+// SecurityConfig holds security-related settings
+type SecurityConfig struct {
+	EnableEncryption bool     `yaml:"enable_encryption"`
+	EncryptionKey    string   `yaml:"encryption_key,omitempty"`
+	TLSCertFile      string   `yaml:"tls_cert_file,omitempty"`
+	TLSKeyFile       string   `yaml:"tls_key_file,omitempty"`
+	TrustedPeers     []string `yaml:"trusted_peers,omitempty"`
+	AuthMode         string   `yaml:"auth_mode"` // none, tls, shared_key
+}
+
+// NetworkConfig defines network topology preferences
+type NetworkConfig struct {
+	MaxPeers           int           `yaml:"max_peers"`
+	MinPeers           int           `yaml:"min_peers"`
+	PeerTimeout        time.Duration `yaml:"peer_timeout"`
+	PreferredZones     []string      `yaml:"preferred_zones,omitempty"`
+	NetworkMode        string        `yaml:"network_mode"`        // mesh, star, hierarchical
+	ConnectionStrategy string        `yaml:"connection_strategy"` // aggressive, conservative
+	BandwidthLimit     int64         `yaml:"bandwidth_limit"`     // bytes per second, 0 for unlimited
+}
+
+// SyncConfig defines synchronization strategies
+type SyncConfig struct {
+	SyncInterval     time.Duration `yaml:"sync_interval"`
+	MaxSyncAttempts  int           `yaml:"max_sync_attempts"`
+	SyncMode         string        `yaml:"sync_mode"`         // full, incremental, selective
+	ConflictStrategy string        `yaml:"conflict_strategy"` // manual, auto-resolve, prefer-local, prefer-remote
+	AutoSyncEnabled  bool          `yaml:"auto_sync_enabled"`
+	ExcludePatterns  []string      `yaml:"exclude_patterns,omitempty"`
+	IncludePatterns  []string      `yaml:"include_patterns,omitempty"`
+	BatchSize        int           `yaml:"batch_size"` // number of files to sync in one batch
+}
+
+// MergeConfig defines merge preferences
+type MergeConfig struct {
+	DefaultStrategy  string   `yaml:"default_strategy"` // ours, theirs, union, manual
+	AutoResolve      bool     `yaml:"auto_resolve"`
+	IgnoreWhitespace bool     `yaml:"ignore_whitespace"`
+	PreferUpstream   bool     `yaml:"prefer_upstream"`
+	CustomMergeTools []string `yaml:"custom_merge_tools,omitempty"`
+}
+
+// DiscoveryConfig defines peer discovery persistence settings
+type DiscoveryConfig struct {
+	PersistenceEnabled bool          `yaml:"persistence_enabled"`
+	StorageDir         string        `yaml:"storage_dir"`
+	PeerCacheTime      time.Duration `yaml:"peer_cache_time"`
+	MaxStoredPeers     int           `yaml:"max_stored_peers"`
 }
 
 // LoadConfig loads the configuration from command-line flags and/or config file.
@@ -23,6 +89,47 @@ func LoadConfig() (*Config, error) {
 		ListenAddress:  ":8080",           // Default listen address
 		RepositoryDir:  "./gitsync-repos", // Default repository directory
 		BootstrapPeers: []string{},        // Default bootstrap peers (empty)
+
+		// Default security settings
+		Security: SecurityConfig{
+			EnableEncryption: false,
+			AuthMode:         "none",
+		},
+
+		// Default network settings
+		Network: NetworkConfig{
+			MaxPeers:           50,
+			MinPeers:           5,
+			PeerTimeout:        5 * time.Minute,
+			NetworkMode:        "mesh",
+			ConnectionStrategy: "conservative",
+		},
+
+		// Default sync settings
+		Sync: SyncConfig{
+			SyncInterval:     5 * time.Minute,
+			MaxSyncAttempts:  3,
+			SyncMode:         "incremental",
+			ConflictStrategy: "manual",
+			AutoSyncEnabled:  true,
+			BatchSize:        100,
+		},
+
+		// Default merge settings
+		Merge: MergeConfig{
+			DefaultStrategy:  "manual",
+			AutoResolve:      false,
+			IgnoreWhitespace: true,
+			PreferUpstream:   false,
+		},
+
+		// Default discovery settings
+		Discovery: DiscoveryConfig{
+			PersistenceEnabled: true,
+			StorageDir:         "./peer-cache",
+			PeerCacheTime:      24 * time.Hour,
+			MaxStoredPeers:     1000,
+		},
 	}
 
 	// Define command-line flags
@@ -41,11 +148,53 @@ func LoadConfig() (*Config, error) {
 	}
 
 	// Basic validation
-	if cfg.RepositoryDir == "" {
-		return nil, fmt.Errorf("repository directory cannot be empty")
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	// Ensure configuration persistence
+	if err := cfg.save(); err != nil {
+		return nil, fmt.Errorf("failed to save configuration: %w", err)
 	}
 
 	return cfg, nil
+}
+
+// validate performs configuration validation
+func (c *Config) validate() error {
+	if c.RepositoryDir == "" {
+		return fmt.Errorf("repository directory cannot be empty")
+	}
+
+	if c.Network.MaxPeers < c.Network.MinPeers {
+		return fmt.Errorf("max_peers cannot be less than min_peers")
+	}
+
+	if c.Sync.BatchSize < 1 {
+		return fmt.Errorf("batch_size must be greater than 0")
+	}
+
+	return nil
+}
+
+// save persists the configuration to disk
+func (c *Config) save() error {
+	configDir := filepath.Join(c.RepositoryDir, ".gitsync")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	configPath := filepath.Join(configDir, "config.yaml")
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
 }
 
 // loadYAMLConfig loads configuration from a YAML file into the provided Config struct
@@ -62,17 +211,115 @@ func loadYAMLConfig(path string, cfg *Config) error {
 	return nil
 }
 
-// GetRepositoryDir returns the configured repository directory.
+// Export configuration getters
 func (c *Config) GetRepositoryDir() string {
 	return c.RepositoryDir
 }
 
-// GetListenAddress returns the configured listen address.
 func (c *Config) GetListenAddress() string {
 	return c.ListenAddress
 }
 
-// GetBootstrapPeers returns the configured bootstrap peers.
 func (c *Config) GetBootstrapPeers() []string {
 	return c.BootstrapPeers
+}
+
+// GetSecurity returns the security configuration
+func (c *Config) GetSecurity() SecurityConfig {
+	return c.Security
+}
+
+// GetNetwork returns the network configuration
+func (c *Config) GetNetwork() NetworkConfig {
+	return c.Network
+}
+
+// GetSync returns the sync configuration
+func (c *Config) GetSync() SyncConfig {
+	return c.Sync
+}
+
+// GetMerge returns the merge configuration
+func (c *Config) GetMerge() MergeConfig {
+	return c.Merge
+}
+
+// GetDiscovery returns the discovery configuration
+func (c *Config) GetDiscovery() DiscoveryConfig {
+	return c.Discovery
+}
+
+// SetSecurityConfig updates security configuration settings
+func (c *Config) SetSecurityConfig(key, value string) error {
+	switch key {
+	case "enable_encryption":
+		c.Security.EnableEncryption = value == "true"
+	case "auth_mode":
+		c.Security.AuthMode = value
+	default:
+		return fmt.Errorf("unknown security setting: %s", key)
+	}
+	return c.save()
+}
+
+// SetNetworkConfig updates network configuration settings
+func (c *Config) SetNetworkConfig(key, value string) error {
+	switch key {
+	case "max_peers":
+		var v int
+		if _, err := fmt.Sscanf(value, "%d", &v); err != nil {
+			return fmt.Errorf("invalid value for max_peers: %s", value)
+		}
+		c.Network.MaxPeers = v
+	case "network_mode":
+		c.Network.NetworkMode = value
+	default:
+		return fmt.Errorf("unknown network setting: %s", key)
+	}
+	return c.save()
+}
+
+// SetSyncConfig updates sync configuration settings
+func (c *Config) SetSyncConfig(key, value string) error {
+	switch key {
+	case "auto_sync_enabled":
+		c.Sync.AutoSyncEnabled = value == "true"
+	case "sync_mode":
+		c.Sync.SyncMode = value
+	case "conflict_strategy":
+		c.Sync.ConflictStrategy = value
+	default:
+		return fmt.Errorf("unknown sync setting: %s", key)
+	}
+	return c.save()
+}
+
+// SetMergeConfig updates merge configuration settings
+func (c *Config) SetMergeConfig(key, value string) error {
+	switch key {
+	case "default_strategy":
+		c.Merge.DefaultStrategy = value
+	case "auto_resolve":
+		c.Merge.AutoResolve = value == "true"
+	default:
+		return fmt.Errorf("unknown merge setting: %s", key)
+	}
+	return c.save()
+}
+
+// SetDiscoveryConfig updates discovery configuration settings
+func (c *Config) SetDiscoveryConfig(key, value string) error {
+	switch key {
+	case "persistence_enabled":
+		c.Discovery.PersistenceEnabled = value == "true"
+	case "max_stored_peers":
+		var v int
+		if _, err := fmt.Sscanf(value, "%d", &v); err != nil {
+			return fmt.Errorf("invalid value for max_stored_peers: %s", value)
+		}
+		c.Discovery.MaxStoredPeers = v
+	default:
+		return fmt.Errorf("unknown discovery setting: %s", key)
+	}
+	return c.save()
 }

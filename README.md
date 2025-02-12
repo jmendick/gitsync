@@ -91,8 +91,92 @@ Go-GitSync will provide a CLI tool (`gitsync`) for managing repositories, peers,
 
 Go-GitSync can be configured via:
 
-*   Command-line flags: As shown in the "Running Go-GitSync" section.
-*   Configuration file (YAML or similar): (Future feature) To manage persistent configuration settings.
+*   Command-line flags
+*   YAML configuration file
+*   Runtime configuration commands
+
+#### Configuration File
+
+Copy the example configuration file to create your own:
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+The configuration file is organized into sections:
+
+##### Security Settings
+```yaml
+security:
+  enable_encryption: false     # Enable end-to-end encryption
+  auth_mode: "none"           # Authentication mode: none, tls, shared_key
+  tls_cert_file: ""          # TLS certificate file path
+  tls_key_file: ""           # TLS key file path
+  trusted_peers: []          # List of trusted peer IDs
+```
+
+##### Network Topology
+```yaml
+network:
+  max_peers: 50              # Maximum number of connected peers
+  min_peers: 5               # Minimum number of connected peers
+  peer_timeout: "5m"         # Peer connection timeout
+  network_mode: "mesh"       # Network topology: mesh, star, hierarchical
+  connection_strategy: "conservative"  # Connection strategy
+  bandwidth_limit: 0         # Bandwidth limit (0 = unlimited)
+```
+
+##### Sync Strategies
+```yaml
+sync:
+  sync_interval: "5m"        # Automatic sync interval
+  sync_mode: "incremental"   # Sync mode: full, incremental, selective
+  conflict_strategy: "manual" # Conflict handling strategy
+  auto_sync_enabled: true    # Enable automatic syncing
+  batch_size: 100           # Files to sync per batch
+```
+
+##### Merge Preferences
+```yaml
+merge:
+  default_strategy: "manual" # Default merge strategy
+  auto_resolve: false       # Auto-resolve non-conflicting changes
+  ignore_whitespace: true   # Ignore whitespace in merges
+  prefer_upstream: false    # Prefer upstream changes
+```
+
+##### Discovery Settings
+```yaml
+discovery:
+  persistence_enabled: true  # Enable peer info persistence
+  storage_dir: "./peer-cache" # Where to store peer information
+  peer_cache_time: "24h"    # How long to cache peer info
+  max_stored_peers: 1000    # Maximum cached peers
+```
+
+#### Managing Configuration
+
+Use the `config` command to view and modify settings:
+
+```bash
+# View all configuration
+gitsync config get
+
+# View specific section
+gitsync config get security
+gitsync config get network
+gitsync config get sync
+gitsync config get merge
+gitsync config get discovery
+
+# Modify settings
+gitsync config set security enable_encryption true
+gitsync config set network max_peers 100
+gitsync config set sync auto_sync_enabled true
+gitsync config set merge default_strategy ours
+```
+
+Each configuration change is automatically persisted and applied to running instances where possible.
 
 ### Synchronization Workflow:
 

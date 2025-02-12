@@ -16,15 +16,22 @@ type MessageType string
 
 const (
 	// Existing message types
-	SyncRequest  MessageType = "SYNC_REQUEST"
-	SyncResponse MessageType = "SYNC_RESPONSE"
-
-	// New discovery message types
+	SyncRequest      MessageType = "SYNC_REQUEST"
+	SyncResponse     MessageType = "SYNC_RESPONSE"
 	PeerAnnounce     MessageType = "PEER_ANNOUNCE"
 	PeerInfo         MessageType = "PEER_INFO"
 	PeerListRequest  MessageType = "PEER_LIST_REQUEST"
 	PeerListResponse MessageType = "PEER_LIST_RESPONSE"
 	Heartbeat        MessageType = "HEARTBEAT"
+
+	// New message types for enhanced protocol
+	RepoStateAdvertise   MessageType = "REPO_STATE_ADVERTISE"
+	RepoStateRequest     MessageType = "REPO_STATE_REQUEST"
+	BranchSyncRequest    MessageType = "BRANCH_SYNC_REQUEST"
+	BranchSyncResponse   MessageType = "BRANCH_SYNC_RESPONSE"
+	ConflictNotification MessageType = "CONFLICT_NOTIFICATION"
+	ConflictResolution   MessageType = "CONFLICT_RESOLUTION"
+	CapabilityExchange   MessageType = "CAPABILITY_EXCHANGE"
 )
 
 // Message represents a protocol message
@@ -33,19 +40,43 @@ type Message struct {
 	Payload map[string]any `json:"payload"`
 }
 
-// PeerAnnounceMessage represents a peer announcing itself to the network
+// New message structures for enhanced protocol
+type RepositoryState struct {
+	Name           string            `json:"name"`
+	Branches       map[string]string `json:"branches"` // branch name -> commit hash
+	HeadCommit     string            `json:"head_commit"`
+	LastUpdateTime time.Time         `json:"last_update_time"`
+}
+
+type BranchSyncInfo struct {
+	RepoName    string   `json:"repo_name"`
+	BranchName  string   `json:"branch_name"`
+	CommitHash  string   `json:"commit_hash"`
+	CommitRange []string `json:"commit_range"` // For partial syncs
+}
+
+type ConflictInfo struct {
+	RepoName     string `json:"repo_name"`
+	BranchName   string `json:"branch_name"`
+	ConflictType string `json:"conflict_type"`
+	FilePath     string `json:"file_path"`
+	Resolution   string `json:"resolution,omitempty"`
+}
+
+type PeerCapabilities struct {
+	ProtocolVersion    string   `json:"protocol_version"`
+	SupportedFeatures  []string `json:"supported_features"`
+	MaxSyncBatchSize   int64    `json:"max_sync_batch_size"`
+	CompressionSupport bool     `json:"compression_support"`
+}
+
+// Message structures
 type PeerAnnounceMessage struct {
 	PeerInfo     model.PeerInfo `json:"peer_info"`
 	TimeStamp    time.Time      `json:"timestamp"`
 	Repositories []string       `json:"repositories"`
 }
 
-// PeerListResponseMessage represents a response to a peer list request
-type PeerListResponseMessage struct {
-	Peers []model.PeerInfo `json:"peers"`
-}
-
-// HeartbeatMessage represents a periodic heartbeat from a peer
 type HeartbeatMessage struct {
 	PeerID    string    `json:"peer_id"`
 	TimeStamp time.Time `json:"timestamp"`
@@ -55,10 +86,15 @@ type HeartbeatMessage struct {
 // ProtocolHandler handles the synchronization protocol messages.
 type ProtocolHandler struct {
 	gitManager *git.GitRepositoryManager
-	// Add new fields for discovery handling
+	// Existing handlers
 	onPeerAnnounce    func(model.PeerInfo)
 	onPeerListRequest func() []model.PeerInfo
 	onHeartbeat       func(string, time.Time)
+	// New handlers
+	onRepoStateRequest     func(string) (*RepositoryState, error)
+	onBranchSyncRequest    func(BranchSyncInfo) error
+	onConflictNotification func(ConflictInfo) error
+	capabilities           PeerCapabilities
 }
 
 // NewProtocolHandler creates a new ProtocolHandler.
@@ -83,6 +119,19 @@ func (ph *ProtocolHandler) SetHeartbeatHandler(handler func(string, time.Time)) 
 	ph.onHeartbeat = handler
 }
 
+// New handler setters for enhanced protocol
+func (ph *ProtocolHandler) SetRepoStateRequestHandler(handler func(string) (*RepositoryState, error)) {
+	ph.onRepoStateRequest = handler
+}
+
+func (ph *ProtocolHandler) SetBranchSyncRequestHandler(handler func(BranchSyncInfo) error) {
+	ph.onBranchSyncRequest = handler
+}
+
+func (ph *ProtocolHandler) SetConflictNotificationHandler(handler func(ConflictInfo) error) {
+	ph.onConflictNotification = handler
+}
+
 // HandleMessage processes an incoming message from a peer.
 func (ph *ProtocolHandler) HandleMessage(conn io.ReadWriter) error {
 	// Read the message
@@ -104,6 +153,16 @@ func (ph *ProtocolHandler) HandleMessage(conn io.ReadWriter) error {
 		return ph.handlePeerListRequest(conn)
 	case Heartbeat:
 		return ph.handleHeartbeat(msg.Payload)
+	case RepoStateRequest:
+		return ph.handleRepoStateRequest(conn, msg.Payload)
+	case RepoStateAdvertise:
+		return ph.handleRepoStateAdvertise(msg.Payload)
+	case BranchSyncRequest:
+		return ph.handleBranchSyncRequest(conn, msg.Payload)
+	case ConflictNotification:
+		return ph.handleConflictNotification(msg.Payload)
+	case CapabilityExchange:
+		return ph.handleCapabilityExchange(conn, msg.Payload)
 	default:
 		return fmt.Errorf("unknown message type: %s", msg.Type)
 	}
@@ -229,4 +288,112 @@ func (ph *ProtocolHandler) handleHeartbeat(payload map[string]any) error {
 		ph.onHeartbeat(heartbeat.PeerID, heartbeat.TimeStamp)
 	}
 	return nil
+}
+
+func (ph *ProtocolHandler) handleRepoStateRequest(conn io.Writer, payload map[string]any) error {
+	repoName, ok := payload["repository"].(string)
+	if !ok {
+		return fmt.Errorf("invalid repository name in request")
+	}
+
+	if ph.onRepoStateRequest == nil {
+		return fmt.Errorf("no repo state request handler configured")
+	}
+
+	state, err := ph.onRepoStateRequest(repoName)
+	if err != nil {
+		return err
+	}
+
+	response := Message{
+		Type: RepoStateAdvertise,
+		Payload: map[string]any{
+			"state": state,
+		},
+	}
+
+	return json.NewEncoder(conn).Encode(response)
+}
+
+func (ph *ProtocolHandler) handleRepoStateAdvertise(payload map[string]any) error {
+	var state RepositoryState
+	data, err := json.Marshal(payload["state"])
+	if err != nil {
+		return fmt.Errorf("failed to marshal state data: %w", err)
+	}
+
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("failed to unmarshal repository state: %w", err)
+	}
+
+	// Process the repository state
+	// Compare with local state and initiate sync if needed
+	return nil
+}
+
+func (ph *ProtocolHandler) handleBranchSyncRequest(conn io.Writer, payload map[string]any) error {
+	var syncInfo BranchSyncInfo
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal sync info: %w", err)
+	}
+
+	if err := json.Unmarshal(data, &syncInfo); err != nil {
+		return fmt.Errorf("failed to unmarshal branch sync info: %w", err)
+	}
+
+	if ph.onBranchSyncRequest != nil {
+		if err := ph.onBranchSyncRequest(syncInfo); err != nil {
+			return err
+		}
+	}
+
+	response := Message{
+		Type: BranchSyncResponse,
+		Payload: map[string]any{
+			"success": true,
+			"branch":  syncInfo.BranchName,
+		},
+	}
+
+	return json.NewEncoder(conn).Encode(response)
+}
+
+func (ph *ProtocolHandler) handleConflictNotification(payload map[string]any) error {
+	var conflictInfo ConflictInfo
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal conflict info: %w", err)
+	}
+
+	if err := json.Unmarshal(data, &conflictInfo); err != nil {
+		return fmt.Errorf("failed to unmarshal conflict info: %w", err)
+	}
+
+	if ph.onConflictNotification != nil {
+		return ph.onConflictNotification(conflictInfo)
+	}
+	return nil
+}
+
+func (ph *ProtocolHandler) handleCapabilityExchange(conn io.Writer, payload map[string]any) error {
+	var peerCapabilities PeerCapabilities
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal capabilities: %w", err)
+	}
+
+	if err := json.Unmarshal(data, &peerCapabilities); err != nil {
+		return fmt.Errorf("failed to unmarshal capabilities: %w", err)
+	}
+
+	// Send our capabilities in response
+	response := Message{
+		Type: CapabilityExchange,
+		Payload: map[string]any{
+			"capabilities": ph.capabilities,
+		},
+	}
+
+	return json.NewEncoder(conn).Encode(response)
 }

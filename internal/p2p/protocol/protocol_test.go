@@ -58,6 +58,72 @@ func TestProtocolMessageEncoding(t *testing.T) {
 			},
 			wantType: Heartbeat,
 		},
+		{
+			name: "repository state request",
+			message: Message{
+				Type: RepoStateRequest,
+				Payload: map[string]any{
+					"repository": "test-repo",
+				},
+			},
+			wantType: RepoStateRequest,
+		},
+		{
+			name: "repository state advertise",
+			message: Message{
+				Type: RepoStateAdvertise,
+				Payload: map[string]any{
+					"state": RepositoryState{
+						Name:           "test-repo",
+						Branches:       map[string]string{"main": "abc123"},
+						HeadCommit:     "abc123",
+						LastUpdateTime: time.Now(),
+					},
+				},
+			},
+			wantType: RepoStateAdvertise,
+		},
+		{
+			name: "branch sync request",
+			message: Message{
+				Type: BranchSyncRequest,
+				Payload: map[string]any{
+					"repo_name":    "test-repo",
+					"branch_name":  "main",
+					"commit_hash":  "abc123",
+					"commit_range": []string{"abc123", "def456"},
+				},
+			},
+			wantType: BranchSyncRequest,
+		},
+		{
+			name: "conflict notification",
+			message: Message{
+				Type: ConflictNotification,
+				Payload: map[string]any{
+					"repo_name":     "test-repo",
+					"branch_name":   "main",
+					"conflict_type": "content",
+					"file_path":     "test.txt",
+				},
+			},
+			wantType: ConflictNotification,
+		},
+		{
+			name: "capability exchange",
+			message: Message{
+				Type: CapabilityExchange,
+				Payload: map[string]any{
+					"capabilities": PeerCapabilities{
+						ProtocolVersion:    "1.0",
+						SupportedFeatures:  []string{"compression", "partial_sync"},
+						MaxSyncBatchSize:   1024 * 1024,
+						CompressionSupport: true,
+					},
+				},
+			},
+			wantType: CapabilityExchange,
+		},
 	}
 
 	for _, tt := range tests {
@@ -230,4 +296,111 @@ func TestPeerListResponse(t *testing.T) {
 			return false
 		}
 	}, time.Second)
+}
+
+func TestRepoStateHandling(t *testing.T) {
+	handler := NewProtocolHandler(nil)
+
+	repoState := &RepositoryState{
+		Name:           "test-repo",
+		Branches:       map[string]string{"main": "abc123"},
+		HeadCommit:     "abc123",
+		LastUpdateTime: time.Now(),
+	}
+
+	handler.SetRepoStateRequestHandler(func(repoName string) (*RepositoryState, error) {
+		if repoName != "test-repo" {
+			t.Errorf("Got repo name %s, want test-repo", repoName)
+		}
+		return repoState, nil
+	})
+
+	var buf bytes.Buffer
+	if err := testutil.SendTestMessage(&buf, string(RepoStateRequest), map[string]any{
+		"repository": "test-repo",
+	}); err != nil {
+		t.Fatalf("Failed to send repo state request: %v", err)
+	}
+
+	if err := handler.HandleMessage(&buf); err != nil {
+		t.Fatalf("Failed to handle repo state request: %v", err)
+	}
+
+	var response Message
+	if err := json.NewDecoder(&buf).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Type != RepoStateAdvertise {
+		t.Errorf("Got response type %s, want %s", response.Type, RepoStateAdvertise)
+	}
+}
+
+func TestConflictHandling(t *testing.T) {
+	handler := NewProtocolHandler(nil)
+
+	conflictReceived := make(chan struct{})
+	expectedConflict := ConflictInfo{
+		RepoName:     "test-repo",
+		BranchName:   "main",
+		ConflictType: "content",
+		FilePath:     "test.txt",
+	}
+
+	handler.SetConflictNotificationHandler(func(conflict ConflictInfo) error {
+		defer close(conflictReceived)
+		if conflict.RepoName != expectedConflict.RepoName {
+			t.Errorf("Got repo name %s, want %s", conflict.RepoName, expectedConflict.RepoName)
+		}
+		return nil
+	})
+
+	var buf bytes.Buffer
+	if err := testutil.SendTestMessage(&buf, string(ConflictNotification), expectedConflict); err != nil {
+		t.Fatalf("Failed to send conflict notification: %v", err)
+	}
+
+	if err := handler.HandleMessage(&buf); err != nil {
+		t.Fatalf("Failed to handle conflict notification: %v", err)
+	}
+
+	testutil.AssertEventually(t, func() bool {
+		select {
+		case <-conflictReceived:
+			return true
+		default:
+			return false
+		}
+	}, time.Second)
+}
+
+func TestCapabilityExchange(t *testing.T) {
+	handler := NewProtocolHandler(nil)
+
+	capabilities := PeerCapabilities{
+		ProtocolVersion:    "1.0",
+		SupportedFeatures:  []string{"compression", "partial_sync"},
+		MaxSyncBatchSize:   1024 * 1024,
+		CompressionSupport: true,
+	}
+
+	var buf bytes.Buffer
+	if err := testutil.SendTestMessage(&buf, string(CapabilityExchange), map[string]any{
+		"capabilities": capabilities,
+	}); err != nil {
+		t.Fatalf("Failed to send capabilities: %v", err)
+	}
+
+	if err := handler.HandleMessage(&buf); err != nil {
+		t.Fatalf("Failed to handle capability exchange: %v", err)
+	}
+
+	var response Message
+	if err := json.NewDecoder(&buf).Decode(&response); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+
+	if response.Type != CapabilityExchange {
+		t.Errorf("Got response type %s, want %s", response.Type, CapabilityExchange)
+	}
 }

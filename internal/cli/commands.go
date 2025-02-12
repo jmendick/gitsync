@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/jmendick/gitsync/internal/config"
@@ -185,21 +186,131 @@ var statusCmd = &cobra.Command{
 var configCmd = &cobra.Command{
 	Use:   "config",
 	Short: "Display or modify configuration",
+	Long: `Manage Go-GitSync configuration settings including security, network,
+synchronization, and merge preferences.`,
+}
+
+// configGetCmd represents the config get command
+var configGetCmd = &cobra.Command{
+	Use:   "get [section]",
+	Short: "Display current configuration",
+	Long: `Display current configuration settings. Optionally specify a section:
+- security: Security-related settings
+- network: Network topology preferences
+- sync: Synchronization strategies
+- merge: Merge preferences
+- discovery: Peer discovery settings`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.LoadConfig()
 		if err != nil {
 			return fmt.Errorf("failed to load config: %w", err)
 		}
 
-		fmt.Printf("Current configuration:\n")
-		fmt.Printf("Listen address: %s\n", cfg.GetListenAddress())
-		fmt.Printf("Repository directory: %s\n", cfg.GetRepositoryDir())
+		// If no section specified, show all
+		if len(args) == 0 {
+			data, err := json.MarshalIndent(cfg, "", "  ")
+			if err != nil {
+				return fmt.Errorf("failed to marshal config: %w", err)
+			}
+			fmt.Println(string(data))
+			return nil
+		}
+
+		// Show specific section
+		switch args[0] {
+		case "security":
+			printJSON(cfg.GetSecurity())
+		case "network":
+			printJSON(cfg.GetNetwork())
+		case "sync":
+			printJSON(cfg.GetSync())
+		case "merge":
+			printJSON(cfg.GetMerge())
+		case "discovery":
+			printJSON(cfg.GetDiscovery())
+		default:
+			return fmt.Errorf("unknown configuration section: %s", args[0])
+		}
+
 		return nil
 	},
 }
 
+// configSetCmd represents the config set command
+var configSetCmd = &cobra.Command{
+	Use:   "set [section] [key] [value]",
+	Short: "Modify configuration settings",
+	Long: `Modify specific configuration settings. Usage:
+gitsync config set [section] [key] [value]
+
+Examples:
+  gitsync config set security enable_encryption true
+  gitsync config set network max_peers 100
+  gitsync config set sync auto_sync_enabled true
+  gitsync config set merge default_strategy ours`,
+	Args: cobra.ExactArgs(3),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := config.LoadConfig()
+		if err != nil {
+			return fmt.Errorf("failed to load config: %w", err)
+		}
+
+		section, key, value := args[0], args[1], args[2]
+
+		switch section {
+		case "security":
+			return setSecurityConfig(cfg, key, value)
+		case "network":
+			return setNetworkConfig(cfg, key, value)
+		case "sync":
+			return setSyncConfig(cfg, key, value)
+		case "merge":
+			return setMergeConfig(cfg, key, value)
+		case "discovery":
+			return setDiscoveryConfig(cfg, key, value)
+		default:
+			return fmt.Errorf("unknown configuration section: %s", section)
+		}
+	},
+}
+
+// Helper functions for the config commands
+func printJSON(v interface{}) {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		fmt.Printf("Error marshaling data: %v\n", err)
+		return
+	}
+	fmt.Println(string(data))
+}
+
+func setSecurityConfig(cfg *config.Config, key, value string) error {
+	return cfg.SetSecurityConfig(key, value)
+}
+
+func setNetworkConfig(cfg *config.Config, key, value string) error {
+	return cfg.SetNetworkConfig(key, value)
+}
+
+func setSyncConfig(cfg *config.Config, key, value string) error {
+	return cfg.SetSyncConfig(key, value)
+}
+
+func setMergeConfig(cfg *config.Config, key, value string) error {
+	return cfg.SetMergeConfig(key, value)
+}
+
+func setDiscoveryConfig(cfg *config.Config, key, value string) error {
+	return cfg.SetDiscoveryConfig(key, value)
+}
+
 // Execute adds all child commands to the root command and sets flags appropriately.
 func Execute() error {
+	// Add config subcommands
+	configCmd.AddCommand(configGetCmd)
+	configCmd.AddCommand(configSetCmd)
+
+	// Add all commands to root
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(shareCmd)
 	rootCmd.AddCommand(syncCmd)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/jmendick/gitsync/internal/config"
 	"github.com/jmendick/gitsync/internal/model"
@@ -17,6 +19,9 @@ type Node struct {
 	listener        net.Listener
 	peerDiscovery   *discovery.DiscoveryService
 	protocolHandler *protocol.ProtocolHandler
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 }
 
 // NewNode creates a new P2P node.
@@ -33,13 +38,17 @@ func NewNode(cfg *config.Config, protocolHandler *protocol.ProtocolHandler) (*No
 		return nil, fmt.Errorf("failed to initialize discovery service: %w", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	node := &Node{
 		config:          cfg,
 		listener:        listener,
 		peerDiscovery:   discService,
 		protocolHandler: protocolHandler,
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 
+	node.wg.Add(2)
 	go node.startPeerDiscovery()
 	go node.startListening()
 
@@ -48,37 +57,83 @@ func NewNode(cfg *config.Config, protocolHandler *protocol.ProtocolHandler) (*No
 
 // Close closes the P2P node and releases resources.
 func (n *Node) Close() error {
+	// Signal shutdown
+	n.cancel()
+
+	// Close listener to stop accepting new connections
 	if n.listener != nil {
 		n.listener.Close()
 	}
+
+	// Stop discovery service
 	if n.peerDiscovery != nil {
 		n.peerDiscovery.Stop()
 	}
+
+	// Wait for goroutines to finish
+	n.wg.Wait()
+
 	fmt.Println("P2P Node closed.")
 	return nil
 }
 
 func (n *Node) startPeerDiscovery() {
+	defer n.wg.Done()
 	fmt.Println("Starting Peer Discovery...")
-	peers := n.peerDiscovery.DiscoverPeers()
-	fmt.Printf("Discovered peers: %+v\n", peers)
+
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		default:
+			peers := n.peerDiscovery.DiscoverPeers()
+			fmt.Printf("Discovered peers: %+v\n", peers)
+			// Add delay between discovery cycles
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+			}
+		}
+	}
 }
 
 func (n *Node) startListening() {
+	defer n.wg.Done()
 	fmt.Println("Listening for incoming connections...")
+
 	for {
-		conn, err := n.listener.Accept()
-		if err != nil {
-			fmt.Printf("Error accepting connection: %v\n", err)
-			continue
+		select {
+		case <-n.ctx.Done():
+			return
+		default:
+			conn, err := n.listener.Accept()
+			if err != nil {
+				if n.ctx.Err() != nil {
+					// Normal shutdown, don't print error
+					return
+				}
+				fmt.Printf("Error accepting connection: %v\n", err)
+				continue
+			}
+			go n.handleConnection(conn)
 		}
-		fmt.Printf("Accepted connection from: %s\n", conn.RemoteAddr())
-		go n.handleConnection(conn)
 	}
 }
 
 func (n *Node) handleConnection(conn net.Conn) {
 	defer conn.Close()
+
+	// Create a context with cancel for this connection
+	ctx, cancel := context.WithCancel(n.ctx)
+	defer cancel()
+
+	// Handle connection closure when node is shutting down
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	if err := n.protocolHandler.HandleMessage(conn); err != nil {
 		fmt.Printf("Error handling message: %v\n", err)
 	}
