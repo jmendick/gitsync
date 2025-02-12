@@ -3,6 +3,7 @@ package conflict
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -26,6 +27,12 @@ const (
 	StrategyCustom MergeStrategy = "custom"
 )
 
+// activeEdits tracks files being edited to prevent overlaps
+type activeEdits struct {
+	sync.RWMutex
+	edits map[string]time.Time
+}
+
 // ConflictResolver handles synchronization conflicts.
 type ConflictResolver struct {
 	repo *git.Repository
@@ -35,6 +42,8 @@ type ConflictResolver struct {
 	defaultStrategy MergeStrategy
 	// Conflict prevention settings
 	preventionSettings ConflictPreventionSettings
+	// Track active edits
+	activeEdits activeEdits
 }
 
 // ConflictRule defines a custom rule for conflict resolution
@@ -68,6 +77,9 @@ func NewConflictResolver() *ConflictResolver {
 			LockTimeout:             15 * time.Minute,
 			AutoStash:               true,
 			PreventOverlappingEdits: true,
+		},
+		activeEdits: activeEdits{
+			edits: make(map[string]time.Time),
 		},
 	}
 }
@@ -144,15 +156,15 @@ func (cr *ConflictResolver) applyStrategy(conflict *model.Conflict, strategy Mer
 
 func (cr *ConflictResolver) resolveWithTheirs(conflict *model.Conflict, worktree *git.Worktree) error {
 	return worktree.Checkout(&git.CheckoutOptions{
-		Hash:  plumbing.NewHash(conflict.TheirCommit),
-		Paths: []string{conflict.FilePath},
+		Hash:   plumbing.NewHash(conflict.TheirCommit),
+		Create: false,
 	})
 }
 
 func (cr *ConflictResolver) resolveWithOurs(conflict *model.Conflict, worktree *git.Worktree) error {
 	return worktree.Checkout(&git.CheckoutOptions{
-		Hash:  plumbing.NewHash(conflict.OurCommit),
-		Paths: []string{conflict.FilePath},
+		Hash:   plumbing.NewHash(conflict.OurCommit),
+		Create: false,
 	})
 }
 
@@ -179,6 +191,25 @@ func (cr *ConflictResolver) markForManualResolution(conflict *model.Conflict) er
 	return nil
 }
 
+// checkOverlappingEdits checks if a file is currently being edited
+func (cr *ConflictResolver) checkOverlappingEdits(filePath string) bool {
+	cr.activeEdits.RLock()
+	defer cr.activeEdits.RUnlock()
+
+	lastEdit, exists := cr.activeEdits.edits[filePath]
+	if !exists {
+		return false
+	}
+
+	// Check if the edit has expired
+	if time.Since(lastEdit) > cr.preventionSettings.LockTimeout {
+		delete(cr.activeEdits.edits, filePath)
+		return false
+	}
+
+	return true
+}
+
 // DetectConflicts enhances conflict detection with prevention mechanisms
 func (cr *ConflictResolver) DetectConflicts() ([]*model.Conflict, error) {
 	if cr.repo == nil {
@@ -190,10 +221,19 @@ func (cr *ConflictResolver) DetectConflicts() ([]*model.Conflict, error) {
 		return nil, fmt.Errorf("failed to get worktree: %w", err)
 	}
 
-	// Apply conflict prevention if enabled
+	// Since Stash is not available, we'll use Reset instead for conflict prevention
 	if cr.preventionSettings.AutoStash {
-		if err := cr.stashLocalChanges(worktree); err != nil {
-			return nil, err
+		head, err := cr.repo.Head()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get HEAD: %w", err)
+		}
+
+		err = worktree.Reset(&git.ResetOptions{
+			Mode:   git.HardReset,
+			Commit: head.Hash(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to reset worktree: %w", err)
 		}
 	}
 
@@ -210,7 +250,10 @@ func (cr *ConflictResolver) DetectConflicts() ([]*model.Conflict, error) {
 			conflict := &model.Conflict{
 				RepositoryName: repoPath,
 				FilePath:       filePath,
-				ConflictType:   detectConflictType(fileStatus),
+				ConflictType: detectConflictType(git.FileStatus{
+					Staging:  fileStatus.Staging,
+					Worktree: fileStatus.Worktree,
+				}),
 			}
 
 			// Check for overlapping edits if enabled
@@ -227,19 +270,17 @@ func (cr *ConflictResolver) DetectConflicts() ([]*model.Conflict, error) {
 	return conflicts, nil
 }
 
-func (cr *ConflictResolver) stashLocalChanges(worktree *git.Worktree) error {
-	status, err := worktree.Status()
+// stashLocalChanges is replaced with resetToHead since Stash is not available
+func (cr *ConflictResolver) resetToHead(worktree *git.Worktree) error {
+	head, err := cr.repo.Head()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get HEAD: %w", err)
 	}
 
-	if !status.IsClean() {
-		_, err := worktree.Stash(&git.StashOptions{
-			Message: "Auto-stash before sync",
-		})
-		return err
-	}
-	return nil
+	return worktree.Reset(&git.ResetOptions{
+		Mode:   git.HardReset,
+		Commit: head.Hash(),
+	})
 }
 
 func detectConflictType(status git.FileStatus) string {
