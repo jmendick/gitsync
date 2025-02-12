@@ -1,6 +1,8 @@
 package util
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -22,6 +24,13 @@ func CheckError(err error) {
 		fmt.Fprintf(os.Stderr, "Fatal error: %s\n", err.Error())
 		panic(err) // Or os.Exit(1) for less drastic exit
 	}
+}
+
+// GeneratePeerID generates a random peer ID
+func GeneratePeerID() string {
+	bytes := make([]byte, 16)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
 }
 
 // ... (Add more utility functions like string helpers, time formatting, etc.) ...
