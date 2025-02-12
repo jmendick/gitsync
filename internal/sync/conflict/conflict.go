@@ -270,19 +270,6 @@ func (cr *ConflictResolver) DetectConflicts() ([]*model.Conflict, error) {
 	return conflicts, nil
 }
 
-// stashLocalChanges is replaced with resetToHead since Stash is not available
-func (cr *ConflictResolver) resetToHead(worktree *git.Worktree) error {
-	head, err := cr.repo.Head()
-	if err != nil {
-		return fmt.Errorf("failed to get HEAD: %w", err)
-	}
-
-	return worktree.Reset(&git.ResetOptions{
-		Mode:   git.HardReset,
-		Commit: head.Hash(),
-	})
-}
-
 func detectConflictType(status git.FileStatus) string {
 	if status.Worktree == 'U' {
 		return "Content"
