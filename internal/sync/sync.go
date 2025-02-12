@@ -3,21 +3,23 @@ package sync
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
-	"github.com/jmendick/gitsync/internal/config" // Replace with your project path
-	"github.com/jmendick/gitsync/internal/git"    // Replace with your project path
-	"github.com/jmendick/gitsync/internal/model"  // Replace with your project path
-	"github.com/jmendick/gitsync/internal/p2p"    // Replace with your project path
-	"github.com/jmendick/gitsync/internal/sync/conflict" // Replace with your project path
+	"github.com/jmendick/gitsync/internal/config"
+	"github.com/jmendick/gitsync/internal/git"
+	"github.com/jmendick/gitsync/internal/p2p"
+	"github.com/jmendick/gitsync/internal/sync/conflict"
 )
 
 // SyncManager manages the synchronization process.
 type SyncManager struct {
-	config    *config.Config
-	p2pNode   *p2p.Node
-	gitManager *git.GitRepositoryManager
+	config           *config.Config
+	p2pNode          *p2p.Node
+	gitManager       *git.GitRepositoryManager
 	conflictResolver *conflict.ConflictResolver
-	// ... sync manager state ...
+	cancelMu         sync.Mutex
+	cancel           context.CancelFunc
 }
 
 // NewSyncManager creates a new SyncManager.
@@ -25,36 +27,59 @@ func NewSyncManager(cfg *config.Config, node *p2p.Node) *SyncManager {
 	gitMgr, err := git.NewGitRepositoryManager(cfg.GetRepositoryDir())
 	if err != nil {
 		fmt.Printf("Error initializing Git Repository Manager: %v\n", err) // Or handle error more gracefully
-		return nil // or panic, depending on error handling strategy
+		return nil                                                         // or panic, depending on error handling strategy
 	}
 
 	conflictResolver := conflict.NewConflictResolver() // Initialize conflict resolver
 
 	return &SyncManager{
-		config:    cfg,
-		p2pNode:   node,
-		gitManager: gitMgr,
+		config:           cfg,
+		p2pNode:          node,
+		gitManager:       gitMgr,
 		conflictResolver: conflictResolver,
-		// ... initialize sync manager state ...
 	}
 }
 
 // Start starts the synchronization manager and background sync processes.
 func (sm *SyncManager) Start() error {
 	fmt.Println("Starting Sync Manager...")
-	// TODO: Implement background synchronization logic (e.g., periodic sync, event-driven sync)
-	go sm.startPeriodicSync() // Example: Start periodic sync in background
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sm.cancelMu.Lock()
+	sm.cancel = cancel
+	sm.cancelMu.Unlock()
+
+	go sm.startPeriodicSync(ctx) // Example: Start periodic sync in background
 	return nil
 }
 
-func (sm *SyncManager) startPeriodicSync() {
+// Stop gracefully stops the sync manager and its background processes.
+func (sm *SyncManager) Stop() error {
+	fmt.Println("Stopping Sync Manager...")
+	sm.cancelMu.Lock()
+	if sm.cancel != nil {
+		sm.cancel()
+	}
+	sm.cancelMu.Unlock()
+	return nil
+}
+
+func (sm *SyncManager) startPeriodicSync(ctx context.Context) {
 	fmt.Println("Starting Periodic Synchronization...")
-	// TODO: Implement periodic synchronization logic
-	// Example:
-	// ticker := time.NewTicker(5 * time.Minute) // Sync every 5 minutes
-	// for range ticker.C {
-	// 	sm.SynchronizeRepositories()
-	// }
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("Stopping periodic synchronization...")
+			return
+		case <-ticker.C:
+			if err := sm.SynchronizeRepositories(); err != nil {
+				fmt.Printf("Error during periodic sync: %v\n", err)
+			}
+		}
+	}
 }
 
 // SynchronizeRepositories synchronizes all managed repositories.
@@ -81,7 +106,7 @@ func (sm *SyncManager) SynchronizeRepositories() error {
 	}
 
 	// Get list of peers for this repo (placeholder - get from config or discovery later)
-	peers := sm.p2pNode.peerDiscovery.DiscoverPeers() // Get discovered peers for now
+	peers := sm.p2pNode.GetPeerDiscovery().DiscoverPeers() // Get discovered peers for now
 
 	if len(peers) > 0 {
 		peerToSync := peers[0] // Sync with the first discovered peer for now

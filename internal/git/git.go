@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // GitRepositoryManager manages Git repositories.
@@ -55,7 +57,7 @@ func (m *GitRepositoryManager) CloneRepository(ctx context.Context, repoName str
 	}
 
 	repo, err := git.PlainCloneContext(ctx, repoPath, false, &git.CloneOptions{
-		URL: remoteURL,
+		URL:      remoteURL,
 		Progress: os.Stdout, // Optionally show clone progress
 	})
 	if err != nil {
@@ -89,4 +91,60 @@ func (m *GitRepositoryManager) GetHeadReference(repo *git.Repository) (*plumbing
 	return headRef, nil
 }
 
-// ... (Add more Git related functions like Commit, Push, Diff, etc. as needed) ...
+// Commit creates a new commit in the repository.
+func (m *GitRepositoryManager) Commit(repo *git.Repository, message string, authorName string, authorEmail string) (plumbing.Hash, error) {
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	// Add changes to the staging area
+	if _, err := worktree.Add("."); err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("failed to add changes: %w", err)
+	}
+
+	// Commit the changes
+	commitHash, err := worktree.Commit(message, &git.CommitOptions{
+		Author: &object.Signature{
+			Name:  authorName,
+			Email: authorEmail,
+			When:  time.Now(),
+		},
+	})
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("failed to commit changes: %w", err)
+	}
+
+	fmt.Printf("Created new commit with hash: %s\n", commitHash.String())
+	return commitHash, nil
+}
+
+// Push pushes the local commits to the remote repository.
+func (m *GitRepositoryManager) Push(repo *git.Repository) error {
+	// Push the changes to the remote repository
+	if err := repo.Push(&git.PushOptions{
+		RemoteName: "origin",
+	}); err != nil {
+		return fmt.Errorf("failed to push changes: %w", err)
+	}
+
+	fmt.Println("Pushed changes to remote repository.")
+	return nil
+}
+
+// Diff shows the differences between the working directory and the index.
+func (m *GitRepositoryManager) Diff(repo *git.Repository) (string, error) {
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return "", fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	diffs, err := worktree.Status()
+	if err != nil {
+		return "", fmt.Errorf("failed to get diffs: %w", err)
+	}
+
+	diffStr := diffs.String()
+	fmt.Println("Differences:", diffStr)
+	return diffStr, nil
+}
