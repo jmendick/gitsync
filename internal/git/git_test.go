@@ -10,7 +10,38 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/jmendick/gitsync/internal/auth"
 )
+
+type mockUserStore struct{}
+
+func (m *mockUserStore) GetUser(username string) (*auth.User, error) {
+	return &auth.User{}, nil
+}
+
+func (m *mockUserStore) CreateUser(username, password string, role auth.Role) error {
+	return nil
+}
+
+func (m *mockUserStore) UpdateUser(user *auth.User) error {
+	return nil
+}
+
+func (m *mockUserStore) DeleteUser(username string) error {
+	return nil
+}
+
+func (m *mockUserStore) ListUsers() ([]*auth.User, error) {
+	return nil, nil
+}
+
+func (m *mockUserStore) Authenticate(username, password string) (*auth.User, error) {
+	return &auth.User{}, nil
+}
+
+func (m *mockUserStore) GetUserByEmail(email string) (*auth.User, error) {
+	return &auth.User{}, nil
+}
 
 func setupTestRepo(t *testing.T) (*GitRepositoryManager, *git.Repository, string) {
 	// Create a temporary directory for the test repository
@@ -19,12 +50,8 @@ func setupTestRepo(t *testing.T) (*GitRepositoryManager, *git.Repository, string
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	// Initialize the repository manager
-	manager, err := NewGitRepositoryManager(tempDir)
-	if err != nil {
-		os.RemoveAll(tempDir)
-		t.Fatalf("Failed to create repository manager: %v", err)
-	}
+	// Initialize the repository manager with mock auth store
+	manager := NewGitRepositoryManager(tempDir, &mockUserStore{})
 
 	// Create a test repository
 	repo, err := manager.OpenRepository("test-repo")

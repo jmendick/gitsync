@@ -3,9 +3,11 @@ package sync
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/jmendick/gitsync/internal/auth"
 	"github.com/jmendick/gitsync/internal/config"
 	"github.com/jmendick/gitsync/internal/git"
 	"github.com/jmendick/gitsync/internal/p2p"
@@ -18,25 +20,23 @@ type SyncManager struct {
 	p2pNode          *p2p.Node
 	gitManager       *git.GitRepositoryManager
 	conflictResolver *conflict.ConflictResolver
+	authStore        auth.UserStore
 	cancelMu         sync.Mutex
 	cancel           context.CancelFunc
 }
 
 // NewSyncManager creates a new SyncManager.
-func NewSyncManager(cfg *config.Config, node *p2p.Node) *SyncManager {
-	gitMgr, err := git.NewGitRepositoryManager(cfg.GetRepositoryDir())
-	if err != nil {
-		fmt.Printf("Error initializing Git Repository Manager: %v\n", err) // Or handle error more gracefully
-		return nil                                                         // or panic, depending on error handling strategy
-	}
+func NewSyncManager(cfg *config.Config, node *p2p.Node, authStore auth.UserStore) *SyncManager {
+	gitMgr := git.NewGitRepositoryManager(cfg.GetRepositoryDir(), authStore)
 
-	conflictResolver := conflict.NewConflictResolver() // Initialize conflict resolver
+	conflictResolver := conflict.NewConflictResolver()
 
 	return &SyncManager{
 		config:           cfg,
 		p2pNode:          node,
 		gitManager:       gitMgr,
 		conflictResolver: conflictResolver,
+		authStore:        authStore,
 	}
 }
 
@@ -64,19 +64,61 @@ func (sm *SyncManager) Stop() error {
 	return nil
 }
 
+// SyncRepository synchronizes a specific repository
+func (sm *SyncManager) SyncRepository(ctx context.Context, user *auth.User, owner, repo string) error {
+	// Verify access permissions
+	hasAccess, err := sm.gitManager.CheckAccess(user, owner, repo)
+	if err != nil {
+		return fmt.Errorf("failed to check repository access: %w", err)
+	}
+	if !hasAccess {
+		return fmt.Errorf("access denied to repository %s/%s", owner, repo)
+	}
+
+	repository, err := sm.gitManager.OpenRepository(fmt.Sprintf("%s/%s", owner, repo))
+	if err != nil {
+		return fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	// Use user's GitHub token for git operations
+	if err := sm.gitManager.FetchRepository(ctx, repository); err != nil {
+		return fmt.Errorf("failed to fetch updates: %w", err)
+	}
+
+	return nil
+}
+
+// startPeriodicSync starts the periodic sync process for all repositories
 func (sm *SyncManager) startPeriodicSync(ctx context.Context) {
-	fmt.Println("Starting Periodic Synchronization...")
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(sm.config.Sync.SyncInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("Stopping periodic synchronization...")
 			return
 		case <-ticker.C:
-			if err := sm.SynchronizeRepositories(); err != nil {
-				fmt.Printf("Error during periodic sync: %v\n", err)
+			sm.syncAll(ctx)
+		}
+	}
+}
+
+func (sm *SyncManager) syncAll(ctx context.Context) {
+	// Get list of all managed repositories
+	repos := sm.gitManager.GetRepositoryList()
+	for _, repoPath := range repos {
+		parts := strings.Split(repoPath, "/")
+		if len(parts) != 2 {
+			fmt.Printf("Invalid repository path format: %s\n", repoPath)
+			continue
+		}
+		owner, repoName := parts[0], parts[1]
+
+		// For each repository, try to use its owner's credentials
+		if user, err := sm.authStore.GetUser(owner); err == nil && user.IsGitHubUser() {
+			if err := sm.SyncRepository(ctx, user, owner, repoName); err != nil {
+				// Log error but continue with other repos
+				fmt.Printf("Failed to sync repository %s/%s: %v\n", owner, repoName, err)
 			}
 		}
 	}

@@ -2,9 +2,13 @@ package git
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-git/go-git/v5"
@@ -12,11 +16,56 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
+	"github.com/jmendick/gitsync/internal/auth"
 )
 
-// GitRepositoryManager manages Git repositories.
+// RepositoryMetadata contains GitHub-specific repository information
+type RepositoryMetadata struct {
+	Owner         string
+	Name          string
+	CloneURL      string
+	Private       bool
+	DefaultBranch string
+}
+
+// ParseGitHubURL extracts owner and repo name from GitHub URL
+func ParseGitHubURL(repoURL string) (*RepositoryMetadata, error) {
+	u, err := url.Parse(repoURL)
+	if err != nil {
+		return nil, err
+	}
+
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid GitHub repository URL")
+	}
+
+	return &RepositoryMetadata{
+		Owner:    parts[0],
+		Name:     parts[1],
+		CloneURL: repoURL,
+	}, nil
+}
+
+// GitRepositoryManager manages Git repositories with GitHub integration
 type GitRepositoryManager struct {
-	repoDir string
+	baseDir     string
+	repos       map[string]*RepositoryMetadata
+	authStore   auth.UserStore
+	permStores  map[string]*auth.PermissionStore
+	permChecker *auth.RepoPermissionChecker
+}
+
+// NewGitRepositoryManager creates a new GitRepositoryManager instance
+func NewGitRepositoryManager(baseDir string, authStore auth.UserStore) *GitRepositoryManager {
+	permChecker := auth.NewRepoPermissionChecker(authStore)
+	return &GitRepositoryManager{
+		baseDir:     baseDir,
+		repos:       make(map[string]*RepositoryMetadata),
+		authStore:   authStore,
+		permStores:  make(map[string]*auth.PermissionStore),
+		permChecker: permChecker,
+	}
 }
 
 // RemoteConfig represents configuration for a remote
@@ -38,22 +87,9 @@ const (
 	MergeStrategyOurs MergeStrategy = "ours"
 )
 
-// NewGitRepositoryManager creates a new GitRepositoryManager.
-func NewGitRepositoryManager(repoDir string) (*GitRepositoryManager, error) {
-	if repoDir == "" {
-		return nil, fmt.Errorf("repository directory cannot be empty")
-	}
-	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(repoDir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create repository directory: %w", err)
-		}
-	}
-	return &GitRepositoryManager{repoDir: repoDir}, nil
-}
-
 // OpenRepository opens an existing Git repository or initializes a new one if it doesn't exist.
 func (m *GitRepositoryManager) OpenRepository(repoName string) (*git.Repository, error) {
-	repoPath := filepath.Join(m.repoDir, repoName)
+	repoPath := filepath.Join(m.baseDir, repoName)
 	repo, err := git.PlainOpen(repoPath)
 	if err == git.ErrRepositoryNotExists {
 		repo, err = git.PlainInit(repoPath, false) // 'false' for not bare repository
@@ -71,7 +107,7 @@ func (m *GitRepositoryManager) OpenRepository(repoName string) (*git.Repository,
 
 // CloneRepository clones a remote Git repository to the local repository directory.
 func (m *GitRepositoryManager) CloneRepository(ctx context.Context, repoName string, remoteURL string) (*git.Repository, error) {
-	repoPath := filepath.Join(m.repoDir, repoName)
+	repoPath := filepath.Join(m.baseDir, repoName)
 	_, err := os.Stat(repoPath)
 	if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("repository '%s' already exists locally", repoName)
@@ -344,4 +380,104 @@ func (m *GitRepositoryManager) Diff(repo *git.Repository) (string, error) {
 	diffStr := diffs.String()
 	fmt.Println("Differences:", diffStr)
 	return diffStr, nil
+}
+
+func (m *GitRepositoryManager) GetRepoMetadata(ctx context.Context, user *auth.User, owner, repo string) (*RepositoryMetadata, error) {
+	if !user.IsGitHubUser() {
+		return nil, fmt.Errorf("GitHub authentication required")
+	}
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+user.Git.AccessToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get repository metadata: %d", resp.StatusCode)
+	}
+
+	var repoData struct {
+		CloneURL      string `json:"clone_url"`
+		Private       bool   `json:"private"`
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&repoData); err != nil {
+		return nil, err
+	}
+
+	return &RepositoryMetadata{
+		Owner:         owner,
+		Name:          repo,
+		CloneURL:      repoData.CloneURL,
+		Private:       repoData.Private,
+		DefaultBranch: repoData.DefaultBranch,
+	}, nil
+}
+
+// Clone clones a GitHub repository using the user's credentials
+func (m *GitRepositoryManager) Clone(ctx context.Context, user *auth.User, owner, repo string) error {
+	metadata, err := m.GetRepoMetadata(ctx, user, owner, repo)
+	if err != nil {
+		return err
+	}
+
+	// Create permission store for the repository
+	repoPath := filepath.Join(m.baseDir, owner, repo)
+	permStore, err := auth.NewPermissionStore(repoPath, m.permChecker)
+	if err != nil {
+		return fmt.Errorf("failed to initialize permission store: %w", err)
+	}
+
+	// Initialize repository permissions from GitHub
+	if err := permStore.RefreshFromGitHub(user); err != nil {
+		return fmt.Errorf("failed to initialize repository permissions: %w", err)
+	}
+
+	// Use GitHub token for authentication
+	cloneURL := strings.Replace(metadata.CloneURL, "https://",
+		fmt.Sprintf("https://%s:%s@", user.Git.Username, user.Git.AccessToken), 1)
+
+	// Set up clone options with credentials
+	cloneOpts := &git.CloneOptions{
+		URL:           cloneURL,
+		Progress:      os.Stdout,
+		SingleBranch:  true,
+		ReferenceName: plumbing.NewBranchReferenceName(metadata.DefaultBranch),
+	}
+
+	if _, err := git.PlainCloneContext(ctx, repoPath, false, cloneOpts); err != nil {
+		return fmt.Errorf("failed to clone repository: %w", err)
+	}
+
+	m.repos[fmt.Sprintf("%s/%s", owner, repo)] = metadata
+	m.permStores[fmt.Sprintf("%s/%s", owner, repo)] = permStore
+	return nil
+}
+
+// CheckAccess verifies if a user has access to a repository
+func (m *GitRepositoryManager) CheckAccess(user *auth.User, owner, repo string) (bool, error) {
+	permStore, ok := m.permStores[fmt.Sprintf("%s/%s", owner, repo)]
+	if !ok {
+		return false, fmt.Errorf("repository not found")
+	}
+
+	return permStore.CheckAccess(user)
+}
+
+// GetRepositoryList returns a list of all managed repositories
+func (m *GitRepositoryManager) GetRepositoryList() []string {
+	var repos []string
+	for repoPath := range m.repos {
+		repos = append(repos, repoPath)
+	}
+	return repos
 }

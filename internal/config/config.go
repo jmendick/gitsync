@@ -3,6 +3,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -30,6 +31,12 @@ type Config struct {
 
 	// Discovery persistence
 	Discovery DiscoveryConfig `yaml:"discovery"`
+
+	// Authentication configuration
+	Auth AuthConfig `yaml:"auth"`
+
+	// Helper methods
+	configDir string
 }
 
 // SecurityConfig holds security-related settings
@@ -82,6 +89,40 @@ type DiscoveryConfig struct {
 	MaxStoredPeers     int           `yaml:"max_stored_peers"`
 }
 
+// AuthConfig holds authentication-related settings
+type AuthConfig struct {
+	Enabled       bool              `yaml:"enabled"`
+	TokenSecret   string            `yaml:"token_secret"`
+	TokenExpiry   string            `yaml:"token_expiry"`
+	AllowedRoles  []Role            `yaml:"allowed_roles"`
+	MinPassLength int               `yaml:"min_password_length"`
+	GitHubOAuth   GitHubOAuthConfig `yaml:"github_oauth"`
+}
+
+type GitHubOAuthConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	ClientID     string `yaml:"client_id"`
+	ClientSecret string `yaml:"client_secret"`
+	CallbackURL  string `yaml:"callback_url"`
+}
+
+// GetAuthURL returns the GitHub OAuth authorization URL
+func (c *GitHubOAuthConfig) GetAuthURL() string {
+	return fmt.Sprintf(
+		"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=repo,read:org",
+		c.ClientID,
+		url.QueryEscape(c.CallbackURL),
+	)
+}
+
+type Role string
+
+const (
+	RoleAdmin  Role = "admin"
+	RoleMember Role = "member"
+	RoleGuest  Role = "guest"
+)
+
 // LoadConfig loads the configuration from command-line flags and/or config file.
 func LoadConfig() (*Config, error) {
 	var configFile string
@@ -130,6 +171,15 @@ func LoadConfig() (*Config, error) {
 			PeerCacheTime:      24 * time.Hour,
 			MaxStoredPeers:     1000,
 		},
+
+		// Default authentication settings
+		Auth: AuthConfig{
+			Enabled:       false,
+			TokenSecret:   "",
+			TokenExpiry:   "24h",
+			AllowedRoles:  []Role{RoleAdmin, RoleMember, RoleGuest},
+			MinPassLength: 8,
+		},
 	}
 
 	// Define command-line flags
@@ -153,6 +203,79 @@ func LoadConfig() (*Config, error) {
 	}
 
 	// Ensure configuration persistence
+	if err := cfg.save(); err != nil {
+		return nil, fmt.Errorf("failed to save configuration: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// LoadConfigFromFile loads configuration from a specific file path
+func LoadConfigFromFile(configPath string) (*Config, error) {
+	cfg := &Config{
+		ListenAddress:  ":8080",           // Default listen address
+		RepositoryDir:  "./gitsync-repos", // Default repository directory
+		BootstrapPeers: []string{},        // Default bootstrap peers (empty)
+
+		// Default security settings
+		Security: SecurityConfig{
+			EnableEncryption: false,
+			AuthMode:         "none",
+		},
+
+		// Default network settings
+		Network: NetworkConfig{
+			MaxPeers:           50,
+			MinPeers:           5,
+			PeerTimeout:        5 * time.Minute,
+			NetworkMode:        "mesh",
+			ConnectionStrategy: "conservative",
+		},
+
+		// Default sync settings
+		Sync: SyncConfig{
+			SyncInterval:     5 * time.Minute,
+			MaxSyncAttempts:  3,
+			SyncMode:         "incremental",
+			ConflictStrategy: "manual",
+			AutoSyncEnabled:  true,
+			BatchSize:        100,
+		},
+
+		// Default merge settings
+		Merge: MergeConfig{
+			DefaultStrategy:  "manual",
+			AutoResolve:      false,
+			IgnoreWhitespace: true,
+			PreferUpstream:   false,
+		},
+
+		// Default discovery settings
+		Discovery: DiscoveryConfig{
+			PersistenceEnabled: true,
+			StorageDir:         "./peer-cache",
+			PeerCacheTime:      24 * time.Hour,
+			MaxStoredPeers:     1000,
+		},
+
+		// Default authentication settings
+		Auth: AuthConfig{
+			Enabled:       false,
+			TokenSecret:   "",
+			TokenExpiry:   "24h",
+			AllowedRoles:  []Role{RoleAdmin, RoleMember, RoleGuest},
+			MinPassLength: 8,
+		},
+	}
+
+	if err := loadYAMLConfig(configPath, cfg); err != nil {
+		return nil, fmt.Errorf("loading config from %s: %w", configPath, err)
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+
 	if err := cfg.save(); err != nil {
 		return nil, fmt.Errorf("failed to save configuration: %w", err)
 	}
@@ -249,6 +372,11 @@ func (c *Config) GetDiscovery() DiscoveryConfig {
 	return c.Discovery
 }
 
+// GetAuth returns the authentication configuration
+func (c *Config) GetAuth() AuthConfig {
+	return c.Auth
+}
+
 // SetSecurityConfig updates security configuration settings
 func (c *Config) SetSecurityConfig(key, value string) error {
 	switch key {
@@ -322,4 +450,52 @@ func (c *Config) SetDiscoveryConfig(key, value string) error {
 		return fmt.Errorf("unknown discovery setting: %s", key)
 	}
 	return c.save()
+}
+
+// SetAuthConfig updates authentication configuration settings
+func (c *Config) SetAuthConfig(key, value string) error {
+	switch key {
+	case "enabled":
+		c.Auth.Enabled = value == "true"
+	case "token_secret":
+		c.Auth.TokenSecret = value
+	case "token_expiry":
+		c.Auth.TokenExpiry = value
+	case "min_password_length":
+		var v int
+		if _, err := fmt.Sscanf(value, "%d", &v); err != nil {
+			return fmt.Errorf("invalid value for min_password_length: %s", value)
+		}
+		c.Auth.MinPassLength = v
+	default:
+		return fmt.Errorf("unknown auth setting: %s", key)
+	}
+	return c.save()
+}
+
+// GetConfigDir returns the configuration directory
+func (c *Config) GetConfigDir() string {
+	if c.configDir == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return filepath.Join(".", ".gitsync")
+		}
+		c.configDir = filepath.Join(homeDir, ".gitsync")
+	}
+	return c.configDir
+}
+
+// GetConfigDir returns the directory where configuration files are stored
+func GetConfigDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get user home directory: %w", err)
+	}
+
+	configDir := filepath.Join(homeDir, ".gitsync")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	return configDir, nil
 }

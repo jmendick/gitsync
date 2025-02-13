@@ -24,6 +24,22 @@ security:
   # List of trusted peer IDs (optional)
   trusted_peers: []
 
+# Authentication configuration
+auth:
+  enabled: true
+  token_secret: "CHANGE_THIS_TO_A_SECURE_SECRET"
+  token_expiry: "24h"
+  allowed_roles:
+    - "admin"
+    - "member"
+    - "guest"
+  min_password_length: 8
+  github_oauth:
+    enabled: false
+    client_id: ""     # Your GitHub OAuth App client ID
+    client_secret: "" # Your GitHub OAuth App client secret
+    callback_url: "http://localhost:8080/auth/github/callback"
+
 # Network topology preferences
 network:
   # Maximum number of connected peers
