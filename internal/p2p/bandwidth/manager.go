@@ -38,6 +38,9 @@ type ConnectionQuality struct {
 
 // NewManager creates a new bandwidth manager
 func NewManager(globalLimit int64) *Manager {
+	if globalLimit <= 0 {
+		globalLimit = math.MaxInt64
+	}
 	return &Manager{
 		globalLimit:    globalLimit,
 		buckets:        make(map[string]*rate.Limiter),
@@ -66,12 +69,14 @@ func (bm *Manager) AcquireBandwidth(peerID string, bytes int64) error {
 
 	if !exists {
 		bm.bucketsMu.Lock()
-		limiter = rate.NewLimiter(rate.Limit(bm.globalLimit/10), int(bm.globalLimit/10)) // Start with 10% of global limit
+		// Set the burst size to max(bytes, globalLimit/10) to handle large transfers
+		burstSize := max(float64(bytes), float64(bm.globalLimit)/10)
+		limiter = rate.NewLimiter(rate.Limit(bm.globalLimit/10), int(burstSize))
 		bm.buckets[peerID] = limiter
 		bm.bucketsMu.Unlock()
 	}
 
-	// Check congestion control
+	// Get congestion controller
 	bm.mu.RLock()
 	cc, exists := bm.congestionCtrl[peerID]
 	bm.mu.RUnlock()
@@ -83,17 +88,19 @@ func (bm *Manager) AcquireBandwidth(peerID string, bytes int64) error {
 		bm.mu.Unlock()
 	}
 
-	// Get current bytes in flight
+	// Check congestion window
 	inFlight, _ := bm.bytesInFlight.LoadOrStore(peerID, float64(0))
 	bytesInFlight := inFlight.(float64)
-
-	// Check if we can send more
-	if !cc.CanSend(bytesInFlight) {
+	if !cc.CanSend(bytesInFlight + float64(bytes)) {
 		return ErrCongestionLimit
 	}
 
+	// Use context with timeout to ensure rate limiting actually takes effect
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(float64(time.Second)*float64(bytes)/float64(bm.globalLimit)))
+	defer cancel()
+
 	// Try to acquire bandwidth
-	if err := limiter.WaitN(context.Background(), int(bytes)); err != nil {
+	if err := limiter.WaitN(ctx, int(bytes)); err != nil {
 		return err
 	}
 

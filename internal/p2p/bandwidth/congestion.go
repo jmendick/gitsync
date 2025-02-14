@@ -8,11 +8,12 @@ import (
 
 // CongestionController implements TCP-like congestion control
 type CongestionController struct {
-	windowSize float64
-	ssthresh   float64
-	state      congestionState
-	rttStats   *RTTStats
-	mu         sync.Mutex
+	windowSize  float64
+	ssthresh    float64
+	state       congestionState
+	rttStats    *RTTStats
+	mu          sync.Mutex
+	lastUpdated time.Time
 }
 
 type congestionState int
@@ -35,10 +36,11 @@ type RTTStats struct {
 
 func NewCongestionController() *CongestionController {
 	return &CongestionController{
-		windowSize: 1024 * 10, // Start with 10KB
-		ssthresh:   math.MaxFloat64,
-		state:      slowStart,
-		rttStats:   newRTTStats(100), // Keep last 100 samples
+		windowSize:  1024 * 10, // Start with 10KB
+		ssthresh:    math.MaxFloat64,
+		state:       slowStart,
+		rttStats:    newRTTStats(100), // Keep last 100 samples
+		lastUpdated: time.Now(),
 	}
 }
 
@@ -52,7 +54,18 @@ func newRTTStats(maxSamples int) *RTTStats {
 func (cc *CongestionController) CanSend(bytesInFlight float64) bool {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-	return bytesInFlight < cc.windowSize
+
+	// Add time-based adjustment to prevent instant transfers
+	elapsed := time.Since(cc.lastUpdated)
+	if elapsed < 10*time.Millisecond {
+		return false
+	}
+
+	canSend := bytesInFlight < cc.windowSize
+	if canSend {
+		cc.lastUpdated = time.Now()
+	}
+	return canSend
 }
 
 func (cc *CongestionController) OnAck(bytes int64) {
@@ -61,38 +74,58 @@ func (cc *CongestionController) OnAck(bytes int64) {
 
 	switch cc.state {
 	case slowStart:
-		cc.windowSize += float64(bytes)
+		// Double window size each RTT
+		cc.windowSize = math.Min(cc.windowSize+float64(bytes), cc.ssthresh)
 		if cc.windowSize >= cc.ssthresh {
 			cc.state = congestionAvoidance
 		}
 	case congestionAvoidance:
-		// Additive increase
-		cc.windowSize += float64(bytes) * float64(bytes) / cc.windowSize
+		// Linear increase
+		cc.windowSize += float64(bytes) * (float64(bytes) / cc.windowSize)
 	case fastRecovery:
 		cc.state = congestionAvoidance
+		cc.windowSize = cc.ssthresh
 	}
+	cc.lastUpdated = time.Now()
 }
 
 func (cc *CongestionController) OnLoss() {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
+	// Multiplicative decrease
 	cc.ssthresh = math.Max(cc.windowSize/2, 1024*10)
 	cc.windowSize = cc.ssthresh
 	cc.state = congestionAvoidance
+	cc.lastUpdated = time.Now()
 }
 
 func (cc *CongestionController) OnTimeout() {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
+	// More aggressive reduction on timeout
 	cc.ssthresh = math.Max(cc.windowSize/2, 1024*10)
 	cc.windowSize = 1024 * 10 // Reset to initial window size
 	cc.state = slowStart
+	cc.lastUpdated = time.Now()
 }
 
 func (cc *CongestionController) UpdateRTT(rtt time.Duration) {
-	cc.rttStats.AddSample(rtt)
+	if rtt > 0 {
+		cc.rttStats.AddSample(rtt)
+	}
+
+	// Adjust window based on RTT
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	smoothedRTT := cc.rttStats.GetSmoothedRTT()
+	if smoothedRTT > 0 {
+		// Adjust window inversely to RTT changes
+		rttFactor := float64(cc.rttStats.GetMinRTT()) / float64(smoothedRTT)
+		cc.windowSize *= rttFactor
+	}
 }
 
 func (cc *CongestionController) GetRTT() time.Duration {

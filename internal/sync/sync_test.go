@@ -7,31 +7,47 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-git/go-git/v5"
+	gogit "github.com/go-git/go-git/v5"
 	"github.com/jmendick/gitsync/internal/auth"
 	"github.com/jmendick/gitsync/internal/config"
+	"github.com/jmendick/gitsync/internal/git"
 	"github.com/jmendick/gitsync/internal/model"
 	"github.com/jmendick/gitsync/internal/p2p"
+	"github.com/jmendick/gitsync/internal/p2p/bandwidth"
+	"github.com/jmendick/gitsync/internal/p2p/protocol"
 	"github.com/jmendick/gitsync/internal/testutil"
 )
 
-// MockP2PNode implements minimal P2P functionality for testing
-type MockP2PNode struct {
-	p2p.Node // Embed p2p.Node to satisfy interface
-	t        *testing.T
+// mockP2PNode embeds p2p.Node to mock functionality for testing
+type mockP2PNode struct {
+	*p2p.Node
+	t *testing.T
 }
 
-func NewMockP2PNode(t *testing.T) *MockP2PNode {
-	return &MockP2PNode{t: t}
+func NewMockP2PNode(t *testing.T) *p2p.Node {
+	cfg := testutil.NewMockConfig()
+	cfg.Config.ListenAddress = "127.0.0.1:0"
+	bwManager := bandwidth.NewManager(1024 * 1024)
+	gitMgr := git.NewGitRepositoryManager("", nil)
+	protocolHandler := protocol.NewProtocolHandler(gitMgr, bwManager)
+	node, err := p2p.NewNode(cfg.Config, protocolHandler)
+	if err != nil {
+		t.Fatalf("Failed to create mock node: %v", err)
+	}
+	return node
 }
 
-func (m *MockP2PNode) GetPeerDiscovery() interface{} {
-	return &MockDiscovery{}
-}
-
+// MockDiscovery implements minimal discovery functionality for testing
 type MockDiscovery struct{}
 
 func (m *MockDiscovery) UpdatePeerStatistics(peerID string, success bool, latency time.Duration) {}
+
+func (m *MockDiscovery) DiscoverPeers() []*model.PeerInfo {
+	return []*model.PeerInfo{{
+		ID:        "test-peer",
+		Addresses: []string{"127.0.0.1:9999"},
+	}}
+}
 
 // MockAuthStore implements minimal auth functionality for testing
 type MockAuthStore struct{}
@@ -64,7 +80,7 @@ func setupTestSync(t *testing.T) (*SyncManager, string, func()) {
 	node := NewMockP2PNode(t)
 	authStore := &MockAuthStore{}
 
-	syncManager, err := NewSyncManager(cfg.Config, &node.Node, authStore)
+	syncManager, err := NewSyncManager(cfg.Config, node, authStore)
 	if err != nil {
 		os.RemoveAll(tempDir)
 		t.Fatalf("Failed to create sync manager: %v", err)
@@ -86,7 +102,7 @@ func TestSyncManager_IncrementalSync(t *testing.T) {
 		t.Fatalf("Failed to create test repo dir: %v", err)
 	}
 
-	repo, err := git.PlainInit(repoPath, false)
+	repo, err := gogit.PlainInit(repoPath, false)
 	if err != nil {
 		t.Fatalf("Failed to initialize test repo: %v", err)
 	}
@@ -131,7 +147,7 @@ func TestBatchProcessing(t *testing.T) {
 			}
 		}
 
-		repo, err := git.PlainInit(repoPath, false)
+		repo, err := gogit.PlainInit(repoPath, false)
 		if err != nil {
 			t.Fatalf("Failed to initialize test repo: %v", err)
 		}
@@ -150,7 +166,7 @@ func TestBatchProcessing(t *testing.T) {
 			t.Fatalf("Failed to create test repo dir: %v", err)
 		}
 
-		repo, err := git.PlainInit(repoPath, false)
+		repo, err := gogit.PlainInit(repoPath, false)
 		if err != nil {
 			t.Fatalf("Failed to initialize test repo: %v", err)
 		}
@@ -199,7 +215,7 @@ func TestConflictResolution(t *testing.T) {
 		t.Fatalf("Failed to create test repo dir: %v", err)
 	}
 
-	repo, err := git.PlainInit(repoPath, false)
+	repo, err := gogit.PlainInit(repoPath, false)
 	if err != nil {
 		t.Fatalf("Failed to initialize test repo: %v", err)
 	}
