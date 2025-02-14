@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -84,7 +85,10 @@ const (
 	// MergeStrategyResolve uses the resolve merge strategy
 	MergeStrategyResolve MergeStrategy = "resolve"
 	// MergeStrategyOurs takes our version in conflicts
-	MergeStrategyOurs MergeStrategy = "ours"
+	MergeStrategyOurs   MergeStrategy = "ours"
+	MergeStrategyTheirs MergeStrategy = "theirs"
+	MergeStrategyUnion  MergeStrategy = "union"
+	MergeStrategyManual MergeStrategy = "manual"
 )
 
 // OpenRepository opens an existing Git repository or initializes a new one if it doesn't exist.
@@ -410,8 +414,9 @@ func (m *GitRepositoryManager) GetRepoMetadata(ctx context.Context, user *auth.U
 		Private       bool   `json:"private"`
 		DefaultBranch string `json:"default_branch"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&repoData); err != nil {
-		return nil, err
+	err = json.NewDecoder(resp.Body).Decode(&repoData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode repository data: %w", err)
 	}
 
 	return &RepositoryMetadata{
@@ -438,7 +443,8 @@ func (m *GitRepositoryManager) Clone(ctx context.Context, user *auth.User, owner
 	}
 
 	// Initialize repository permissions from GitHub
-	if err := permStore.RefreshFromGitHub(user); err != nil {
+	err = permStore.RefreshFromGitHub(user)
+	if err != nil {
 		return fmt.Errorf("failed to initialize repository permissions: %w", err)
 	}
 
@@ -475,9 +481,291 @@ func (m *GitRepositoryManager) CheckAccess(user *auth.User, owner, repo string) 
 
 // GetRepositoryList returns a list of all managed repositories
 func (m *GitRepositoryManager) GetRepositoryList() []string {
-	var repos []string
+	repos := make([]string, 0, len(m.repos))
 	for repoPath := range m.repos {
 		repos = append(repos, repoPath)
 	}
 	return repos
+}
+
+// GetChangesSince returns list of changes since a specific commit
+func (m *GitRepositoryManager) GetChangesSince(repo *git.Repository, commitHash string) ([]string, error) {
+	if commitHash == "" {
+		return m.getAllFiles(repo)
+	}
+
+	from, err := repo.CommitObject(plumbing.NewHash(commitHash))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get commit object: %w", err)
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get HEAD: %w", err)
+	}
+
+	to, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get HEAD commit: %w", err)
+	}
+
+	patch, err := from.Patch(to)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create patch: %w", err)
+	}
+
+	var changes []string
+	for _, filePatch := range patch.FilePatches() {
+		from, to := filePatch.Files()
+		if from != nil {
+			changes = append(changes, from.Path())
+		}
+		if to != nil && (from == nil || to.Path() != from.Path()) {
+			changes = append(changes, to.Path())
+		}
+	}
+
+	return changes, nil
+}
+
+// GetFilteredChanges returns changes that match include patterns and don't match exclude patterns
+func (m *GitRepositoryManager) GetFilteredChanges(repo *git.Repository, includes, excludes []string) ([]string, error) {
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	status, err := worktree.Status()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get status: %w", err)
+	}
+
+	var changes []string
+	for filePath := range status {
+		if shouldIncludeFile(filePath, includes, excludes) {
+			changes = append(changes, filePath)
+		}
+	}
+
+	return changes, nil
+}
+
+// ResetToClean resets the repository to a clean state
+func (m *GitRepositoryManager) ResetToClean(repo *git.Repository) error {
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		return fmt.Errorf("failed to get HEAD: %w", err)
+	}
+
+	err = worktree.Reset(&git.ResetOptions{
+		Mode:   git.HardReset,
+		Commit: head.Hash(),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to reset worktree: %w", err)
+	}
+
+	err = worktree.Clean(&git.CleanOptions{
+		Dir: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to clean worktree: %w", err)
+	}
+
+	return nil
+}
+
+// GetConflictVersions returns different versions of a file in conflict
+func (m *GitRepositoryManager) GetConflictVersions(repo *git.Repository, path string) ([]ConflictVersion, error) {
+	w, err := repo.Worktree()
+	if err != nil {
+		return nil, err
+	}
+
+	status, err := w.Status()
+	if err != nil {
+		return nil, err
+	}
+
+	fileStatus := status.File(path)
+	if fileStatus.Worktree != git.Untracked && fileStatus.Staging != git.Modified {
+		return nil, fmt.Errorf("file is not in conflict")
+	}
+
+	// Get our version (stage 2)
+	ours := ConflictVersion{
+		PeerID:    "ours",
+		Timestamp: time.Now(),
+	}
+
+	// Get their version (stage 3)
+	theirs := ConflictVersion{
+		PeerID:    "theirs",
+		Timestamp: time.Now(),
+	}
+
+	idx, err := repo.Storer.Index()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, e := range idx.Entries {
+		if e.Name == path {
+			obj, err := repo.Object(plumbing.BlobObject, e.Hash)
+			if err != nil {
+				continue
+			}
+			if blob, ok := obj.(*object.Blob); ok {
+				content, err := blob.Reader()
+				if err == nil {
+					data, err := io.ReadAll(content)
+					if err == nil {
+						if e.Stage == 2 {
+							ours.Hash = e.Hash.String()
+							ours.Content = data
+						} else if e.Stage == 3 {
+							theirs.Hash = e.Hash.String()
+							theirs.Content = data
+						}
+					}
+					content.Close()
+				}
+			}
+		}
+	}
+
+	versions := []ConflictVersion{ours, theirs}
+	return versions, nil
+}
+
+// ResolveConflict resolves a conflict by choosing a strategy
+func (m *GitRepositoryManager) ResolveConflict(repo *git.Repository, path string, strategy string) error {
+	w, err := repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	switch strategy {
+	case "ours":
+		return w.Checkout(&git.CheckoutOptions{
+			Hash: plumbing.NewHash("HEAD"),
+		})
+	case "theirs":
+		return w.Checkout(&git.CheckoutOptions{
+			Hash: plumbing.NewHash("MERGE_HEAD"),
+		})
+	case "union":
+		versions, err := m.GetConflictVersions(repo, path)
+		if err != nil {
+			return err
+		}
+
+		var combined []byte
+		for _, version := range versions {
+			combined = append(combined, []byte("<<<<<<< "+version.PeerID+"\n")...)
+			combined = append(combined, version.Content...)
+			combined = append(combined, []byte("\n=======\n")...)
+		}
+		combined = append(combined, []byte(">>>>>>> END\n")...)
+
+		file, err := w.Filesystem.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		if _, err := file.Write(combined); err != nil {
+			return err
+		}
+
+		_, err = w.Add(path)
+		return err
+	default:
+		return fmt.Errorf("unknown conflict resolution strategy: %s", strategy)
+	}
+}
+
+// ConflictVersion represents a version of a file in conflict
+type ConflictVersion struct {
+	PeerID    string    `json:"peer_id"`
+	Timestamp time.Time `json:"timestamp"`
+	Hash      string    `json:"hash"`
+	Content   []byte    `json:"content"`
+}
+
+// Conflict represents a Git merge conflict
+type Conflict struct {
+	ID        string            `json:"id"`
+	FilePath  string            `json:"file_path"`
+	Versions  []ConflictVersion `json:"versions"`
+	Status    string            `json:"status"`
+	CreatedAt time.Time         `json:"created_at"`
+}
+
+// ConflictResolutionResult represents the result of conflict resolution
+type ConflictResolutionResult struct {
+	FilePath      string
+	ResolvingHash string
+	Strategy      MergeStrategy
+	Success       bool
+	Error         error
+}
+
+// Helper functions
+
+func (m *GitRepositoryManager) getAllFiles(repo *git.Repository) ([]string, error) {
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return nil, err
+	}
+
+	var files []string
+	err = filepath.Walk(worktree.Filesystem.Root(), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			relPath, err := filepath.Rel(worktree.Filesystem.Root(), path)
+			if err != nil {
+				return err
+			}
+			files = append(files, relPath)
+		}
+		return nil
+	})
+
+	return files, err
+}
+
+func shouldIncludeFile(filePath string, includes, excludes []string) bool {
+	// If no include patterns are specified, include everything
+	if len(includes) == 0 {
+		includes = []string{"*"}
+	}
+
+	included := false
+	for _, pattern := range includes {
+		if match, _ := filepath.Match(pattern, filePath); match {
+			included = true
+			break
+		}
+	}
+
+	if !included {
+		return false
+	}
+
+	// Check exclude patterns
+	for _, pattern := range excludes {
+		if match, _ := filepath.Match(pattern, filePath); match {
+			return false
+		}
+	}
+
+	return true
 }

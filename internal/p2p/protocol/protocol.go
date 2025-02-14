@@ -1,37 +1,53 @@
 package protocol
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
+	"net"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/jmendick/gitsync/internal/git"
 	"github.com/jmendick/gitsync/internal/model"
+	"github.com/jmendick/gitsync/internal/p2p/bandwidth"
 )
 
-// MessageType represents the type of protocol message
 type MessageType string
 
 const (
-	// Existing message types
-	SyncRequest      MessageType = "SYNC_REQUEST"
-	SyncResponse     MessageType = "SYNC_RESPONSE"
+	// Basic sync types
+	SyncRequest  MessageType = "SYNC_REQUEST"
+	SyncResponse MessageType = "SYNC_RESPONSE"
+	SyncBatch    MessageType = "SYNC_BATCH"
+	SyncProgress MessageType = "SYNC_PROGRESS"
+
+	// Peer management types
 	PeerAnnounce     MessageType = "PEER_ANNOUNCE"
 	PeerInfo         MessageType = "PEER_INFO"
 	PeerListRequest  MessageType = "PEER_LIST_REQUEST"
 	PeerListResponse MessageType = "PEER_LIST_RESPONSE"
 	Heartbeat        MessageType = "HEARTBEAT"
 
-	// New message types for enhanced protocol
-	RepoStateAdvertise   MessageType = "REPO_STATE_ADVERTISE"
-	RepoStateRequest     MessageType = "REPO_STATE_REQUEST"
-	BranchSyncRequest    MessageType = "BRANCH_SYNC_REQUEST"
-	BranchSyncResponse   MessageType = "BRANCH_SYNC_RESPONSE"
-	ConflictNotification MessageType = "CONFLICT_NOTIFICATION"
-	ConflictResolution   MessageType = "CONFLICT_RESOLUTION"
-	CapabilityExchange   MessageType = "CAPABILITY_EXCHANGE"
+	// Consensus types
+	ConsensusPropose MessageType = "CONSENSUS_PROPOSE"
+	ConsensusVote    MessageType = "CONSENSUS_VOTE"
+	ConsensusCommit  MessageType = "CONSENSUS_COMMIT"
+	ConsensusAbort   MessageType = "CONSENSUS_ABORT"
+
+	// FileTransfer message types
+	FileChunkRequest  MessageType = "FILE_CHUNK_REQUEST"
+	FileChunkResponse MessageType = "FILE_CHUNK_RESPONSE"
+	TransferComplete  MessageType = "TRANSFER_COMPLETE"
+
+	// Conflict resolution types
+	ConflictResolutionPropose MessageType = "CONFLICT_RESOLUTION_PROPOSE"
+	ConflictResolutionVote    MessageType = "CONFLICT_RESOLUTION_VOTE"
 )
 
 // Message represents a protocol message
@@ -40,360 +56,528 @@ type Message struct {
 	Payload map[string]any `json:"payload"`
 }
 
-// New message structures for enhanced protocol
-type RepositoryState struct {
-	Name           string            `json:"name"`
-	Branches       map[string]string `json:"branches"` // branch name -> commit hash
-	HeadCommit     string            `json:"head_commit"`
-	LastUpdateTime time.Time         `json:"last_update_time"`
+// FileChunk represents a piece of a file being transferred
+type FileChunk struct {
+	SessionID string
+	Offset    int64
+	Data      []byte
+	Hash      string // SHA-256 hash for verification
+	Total     int64  // Total file size
+	Index     int    // Chunk index
+	Count     int    // Total number of chunks
 }
 
-type BranchSyncInfo struct {
-	RepoName    string   `json:"repo_name"`
-	BranchName  string   `json:"branch_name"`
-	CommitHash  string   `json:"commit_hash"`
-	CommitRange []string `json:"commit_range"` // For partial syncs
+// TransferSession represents an active file transfer
+type TransferSession struct {
+	ID                string
+	FilePath          string
+	FileSize          int64
+	ChunkSize         int64
+	ReceivedChunks    map[int][]byte
+	VerifiedChunks    map[int]bool
+	OutstandingChunks map[int64]time.Time
+	Stats             *TransferStats
+	LastActivity      time.Time
+	mu                sync.Mutex
 }
 
-type ConflictInfo struct {
-	RepoName     string `json:"repo_name"`
-	BranchName   string `json:"branch_name"`
-	ConflictType string `json:"conflict_type"`
-	FilePath     string `json:"file_path"`
-	Resolution   string `json:"resolution,omitempty"`
+// TransferStats tracks statistics for a transfer session
+type TransferStats struct {
+	StartTime     time.Time
+	BytesTotal    int64
+	BytesSent     int64
+	BytesReceived int64
+	Retransmits   int64
+	RTTStats      []time.Duration
 }
 
-type PeerCapabilities struct {
-	ProtocolVersion    string   `json:"protocol_version"`
-	SupportedFeatures  []string `json:"supported_features"`
-	MaxSyncBatchSize   int64    `json:"max_sync_batch_size"`
-	CompressionSupport bool     `json:"compression_support"`
+// ChunkAck represents a chunk acknowledgment
+type ChunkAck struct {
+	SessionID string
+	Offset    int64
+	RTT       time.Duration
 }
 
-// Message structures
-type PeerAnnounceMessage struct {
-	PeerInfo     model.PeerInfo `json:"peer_info"`
-	TimeStamp    time.Time      `json:"timestamp"`
-	Repositories []string       `json:"repositories"`
+// ConflictProposal represents a proposed conflict resolution
+type ConflictProposal struct {
+	ConflictID string           `json:"conflict_id"`
+	RepoPath   string           `json:"repo_path"`
+	FilePath   string           `json:"file_path"`
+	Timestamp  time.Time        `json:"timestamp"`
+	Strategy   string           `json:"strategy"`
+	Changes    []ConflictChange `json:"changes"`
 }
 
-type HeartbeatMessage struct {
+// ConflictChange represents a version of a conflicted file
+type ConflictChange struct {
 	PeerID    string    `json:"peer_id"`
-	TimeStamp time.Time `json:"timestamp"`
-	Status    string    `json:"status"`
+	Timestamp time.Time `json:"timestamp"`
+	Hash      string    `json:"hash"`
+	Content   []byte    `json:"content"`
 }
 
-// ProtocolHandler handles the synchronization protocol messages.
+// ConflictVote represents a vote on a conflict resolution
+type ConflictVote struct {
+	ConflictID string    `json:"conflict_id"`
+	PeerID     string    `json:"peer_id"`
+	Accept     bool      `json:"accept"`
+	Strategy   string    `json:"strategy"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+// ProtocolHandler manages protocol message handling
 type ProtocolHandler struct {
-	gitManager *git.GitRepositoryManager
-	// Existing handlers
-	onPeerAnnounce    func(model.PeerInfo)
-	onPeerListRequest func() []model.PeerInfo
-	onHeartbeat       func(string, time.Time)
-	// New handlers
-	onRepoStateRequest     func(string) (*RepositoryState, error)
-	onBranchSyncRequest    func(BranchSyncInfo) error
-	onConflictNotification func(ConflictInfo) error
-	capabilities           PeerCapabilities
+	gitManager   *git.GitRepositoryManager
+	bandwidthMgr *bandwidth.Manager
+	ctx          context.Context
+	cancel       context.CancelFunc
+
+	// Event handlers
+	onPeerAnnounce     func(*model.PeerInfo)
+	onPeerListRequest  func() []model.PeerInfo
+	onHeartbeat        func(string, time.Time)
+	onSyncProgress     func(*model.SyncOperation)
+	onMetadataUpdate   func(string, *model.SyncMetrics)
+	onConsensusPropose func(*model.SyncProposal) (*model.SyncVote, error)
+	onConsensusVote    func(*model.SyncVote) error
+	onConsensusCommit  func(*model.SyncCommit) error
+
+	// Transfer management
+	transfersMu     sync.RWMutex
+	activeTransfers map[string]*TransferSession
+	chunkAcks       chan ChunkAck
 }
 
-// NewProtocolHandler creates a new ProtocolHandler.
-func NewProtocolHandler(gitManager *git.GitRepositoryManager) *ProtocolHandler {
-	return &ProtocolHandler{
-		gitManager: gitManager,
+func NewProtocolHandler(gitManager *git.GitRepositoryManager, bandwidthMgr *bandwidth.Manager) *ProtocolHandler {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ph := &ProtocolHandler{
+		gitManager:      gitManager,
+		bandwidthMgr:    bandwidthMgr,
+		ctx:             ctx,
+		cancel:          cancel,
+		activeTransfers: make(map[string]*TransferSession),
+		chunkAcks:       make(chan ChunkAck, 1000),
+	}
+
+	go ph.monitorTransfers()
+	return ph
+}
+
+func (ph *ProtocolHandler) monitorTransfers() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ph.ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			ph.transfersMu.Lock()
+			for id, session := range ph.activeTransfers {
+				session.mu.Lock()
+				if len(session.OutstandingChunks) > 0 {
+					oldestChunk := now
+					for _, sendTime := range session.OutstandingChunks {
+						if sendTime.Before(oldestChunk) {
+							oldestChunk = sendTime
+						}
+					}
+					if now.Sub(oldestChunk) > 10*time.Second {
+						// Chunk timeout - retransmit needed
+						session.Stats.Retransmits++
+					}
+				}
+				if now.Sub(session.LastActivity) > 30*time.Second {
+					// Session timeout
+					delete(ph.activeTransfers, id)
+				}
+				session.mu.Unlock()
+			}
+			ph.transfersMu.Unlock()
+		}
 	}
 }
 
-// SetPeerAnnounceHandler sets the handler for peer announcements
-func (ph *ProtocolHandler) SetPeerAnnounceHandler(handler func(model.PeerInfo)) {
-	ph.onPeerAnnounce = handler
+func (ph *ProtocolHandler) handleFileChunk(chunk *FileChunk) error {
+	ph.transfersMu.Lock()
+	session, exists := ph.activeTransfers[chunk.SessionID]
+	ph.transfersMu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("unknown transfer session: %s", chunk.SessionID)
+	}
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	// Verify chunk hash
+	hasher := sha256.New()
+	hasher.Write(chunk.Data)
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+	if actualHash != chunk.Hash {
+		return fmt.Errorf("chunk hash mismatch")
+	}
+
+	// Store verified chunk
+	session.ReceivedChunks[chunk.Index] = chunk.Data
+	session.VerifiedChunks[chunk.Index] = true
+	delete(session.OutstandingChunks, chunk.Offset)
+	session.LastActivity = time.Now()
+
+	// Check if transfer is complete
+	if len(session.VerifiedChunks) == chunk.Count {
+		return ph.assembleFile(session)
+	}
+
+	return nil
 }
 
-// SetPeerListRequestHandler sets the handler for peer list requests
-func (ph *ProtocolHandler) SetPeerListRequestHandler(handler func() []model.PeerInfo) {
-	ph.onPeerListRequest = handler
+func (ph *ProtocolHandler) assembleFile(session *TransferSession) error {
+	// Create temporary file
+	tempFile, err := os.CreateTemp("", "gitsync-transfer-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer tempFile.Close()
+
+	// Assemble chunks in order
+	for i := 0; i < len(session.ReceivedChunks); i++ {
+		chunk, exists := session.ReceivedChunks[i]
+		if !exists {
+			return fmt.Errorf("missing chunk %d", i)
+		}
+		if _, err := tempFile.Write(chunk); err != nil {
+			return fmt.Errorf("failed to write chunk: %w", err)
+		}
+	}
+
+	// Move assembled file to final location
+	if err := os.Rename(tempFile.Name(), session.FilePath); err != nil {
+		return fmt.Errorf("failed to move assembled file: %w", err)
+	}
+
+	return nil
 }
 
-// SetHeartbeatHandler sets the handler for peer heartbeats
-func (ph *ProtocolHandler) SetHeartbeatHandler(handler func(string, time.Time)) {
-	ph.onHeartbeat = handler
+func (ph *ProtocolHandler) SendFileChunk(conn net.Conn, chunk *FileChunk) error {
+	return ph.SendMessage(conn, FileChunkResponse, chunk)
 }
 
-// New handler setters for enhanced protocol
-func (ph *ProtocolHandler) SetRepoStateRequestHandler(handler func(string) (*RepositoryState, error)) {
-	ph.onRepoStateRequest = handler
+func (ph *ProtocolHandler) SendBatchWithCompression(conn net.Conn, msg *Message) (int64, error) {
+	compressed, size, err := ph.compressMessage(msg)
+	if err != nil {
+		return 0, err
+	}
+	return size, ph.SendMessage(conn, msg.Type, compressed)
 }
 
-func (ph *ProtocolHandler) SetBranchSyncRequestHandler(handler func(BranchSyncInfo) error) {
-	ph.onBranchSyncRequest = handler
-}
-
-func (ph *ProtocolHandler) SetConflictNotificationHandler(handler func(ConflictInfo) error) {
-	ph.onConflictNotification = handler
-}
-
-// HandleMessage processes an incoming message from a peer.
-func (ph *ProtocolHandler) HandleMessage(conn io.ReadWriter) error {
-	// Read the message
-	decoder := json.NewDecoder(conn)
+func (ph *ProtocolHandler) ReadMessage(conn net.Conn) (*Message, error) {
 	var msg Message
-	if err := decoder.Decode(&msg); err != nil {
-		return fmt.Errorf("failed to decode message: %w", err)
+	if err := json.NewDecoder(conn).Decode(&msg); err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+
+func (ph *ProtocolHandler) ProposeSync(conn net.Conn, proposal *model.SyncProposal) error {
+	return ph.SendMessage(conn, ConsensusPropose, proposal)
+}
+
+func (ph *ProtocolHandler) ProposeConflictResolution(conn net.Conn, proposal *ConflictProposal) error {
+	return ph.SendMessage(conn, ConflictResolutionPropose, proposal)
+}
+
+func (ph *ProtocolHandler) compressMessage(msg *Message) ([]byte, int64, error) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, 0, err
 	}
 
-	// Process message based on type
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(data); err != nil {
+		return nil, 0, err
+	}
+	if err := gw.Close(); err != nil {
+		return nil, 0, err
+	}
+
+	compressed := buf.Bytes()
+	return compressed, int64(len(data)), nil
+}
+
+// Message handling methods
+func (ph *ProtocolHandler) SendMessage(conn net.Conn, msgType MessageType, payload interface{}) error {
+	data := make(map[string]any)
+
+	// Convert payload to map[string]any
+	if payload != nil {
+		jsonBytes, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+
+		if err := json.Unmarshal(jsonBytes, &data); err != nil {
+			return err
+		}
+	}
+
+	msg := Message{
+		Type:    msgType,
+		Payload: data,
+	}
+	return json.NewEncoder(conn).Encode(msg)
+}
+
+// HandleMessage handles an incoming message from a connection
+func (ph *ProtocolHandler) HandleMessage(conn net.Conn) error {
+	msg, err := ph.ReadMessage(conn)
+	if err != nil {
+		return fmt.Errorf("failed to read message: %w", err)
+	}
+
 	switch msg.Type {
 	case SyncRequest:
-		return ph.handleSyncRequest(conn, msg.Payload)
-	case SyncResponse:
-		return ph.handleSyncResponse(msg.Payload)
-	case PeerAnnounce:
-		return ph.handlePeerAnnounce(msg.Payload)
-	case PeerListRequest:
-		return ph.handlePeerListRequest(conn)
+		return ph.handleSyncRequest(conn, msg)
+	case FileChunkResponse:
+		var chunk FileChunk
+		if err := mapToStruct(msg.Payload, &chunk); err != nil {
+			return err
+		}
+		return ph.handleFileChunk(&chunk)
 	case Heartbeat:
-		return ph.handleHeartbeat(msg.Payload)
-	case RepoStateRequest:
-		return ph.handleRepoStateRequest(conn, msg.Payload)
-	case RepoStateAdvertise:
-		return ph.handleRepoStateAdvertise(msg.Payload)
-	case BranchSyncRequest:
-		return ph.handleBranchSyncRequest(conn, msg.Payload)
-	case ConflictNotification:
-		return ph.handleConflictNotification(msg.Payload)
-	case CapabilityExchange:
-		return ph.handleCapabilityExchange(conn, msg.Payload)
+		return ph.handleHeartbeat(conn, msg)
+	case PeerAnnounce:
+		var peer model.PeerInfo
+		if err := mapToStruct(msg.Payload, &peer); err != nil {
+			return err
+		}
+		if ph.onPeerAnnounce != nil {
+			ph.onPeerAnnounce(&peer)
+		}
+		return nil
+	case PeerListRequest:
+		if ph.onPeerListRequest != nil {
+			peers := ph.onPeerListRequest()
+			return ph.SendMessage(conn, PeerListResponse, map[string]interface{}{
+				"peers": peers,
+			})
+		}
+		return nil
+	case ConsensusPropose:
+		var proposal model.SyncProposal
+		if err := mapToStruct(msg.Payload, &proposal); err != nil {
+			return err
+		}
+		if ph.onConsensusPropose != nil {
+			vote, err := ph.onConsensusPropose(&proposal)
+			if err != nil {
+				return err
+			}
+			return ph.SendMessage(conn, ConsensusVote, vote)
+		}
+		return nil
+	case ConsensusVote:
+		var vote model.SyncVote
+		if err := mapToStruct(msg.Payload, &vote); err != nil {
+			return err
+		}
+		if ph.onConsensusVote != nil {
+			return ph.onConsensusVote(&vote)
+		}
+		return nil
+	case ConsensusCommit:
+		var commit model.SyncCommit
+		if err := mapToStruct(msg.Payload, &commit); err != nil {
+			return err
+		}
+		if ph.onConsensusCommit != nil {
+			return ph.onConsensusCommit(&commit)
+		}
+		return nil
 	default:
 		return fmt.Errorf("unknown message type: %s", msg.Type)
 	}
 }
 
-// SendSyncRequestMessage sends a sync request message to a peer.
-func (ph *ProtocolHandler) SendSyncRequestMessage(conn io.Writer, repoName string) error {
-	msg := Message{
-		Type: SyncRequest,
-		Payload: map[string]any{
-			"repository": repoName,
-		},
+// handleSyncRequest handles incoming sync requests
+func (ph *ProtocolHandler) handleSyncRequest(conn net.Conn, msg *Message) error {
+	var request struct {
+		Repository string    `json:"repository"`
+		Timestamp  time.Time `json:"timestamp"`
+	}
+	if err := mapToStruct(msg.Payload, &request); err != nil {
+		return fmt.Errorf("failed to parse sync request: %w", err)
 	}
 
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(msg); err != nil {
-		return fmt.Errorf("failed to encode sync request: %w", err)
+	// Call sync operation handler if registered
+	if ph.onSyncProgress != nil {
+		ph.onSyncProgress(&model.SyncOperation{
+			RepositoryID: request.Repository,
+			StartTime:    request.Timestamp,
+			Status:       "running",
+		})
 	}
-	return nil
+
+	// Send sync response
+	return ph.SendMessage(conn, SyncResponse, map[string]interface{}{
+		"status":    "acknowledged",
+		"timestamp": time.Now(),
+	})
 }
 
-// SendSyncResponseMessage sends a sync response message to a peer.
-func (ph *ProtocolHandler) SendSyncResponseMessage(conn io.Writer, success bool, message string) error {
-	msg := Message{
-		Type: SyncResponse,
-		Payload: map[string]any{
-			"success": success,
-			"message": message,
-		},
+// handleHeartbeat handles incoming heartbeat messages
+func (ph *ProtocolHandler) handleHeartbeat(conn net.Conn, msg *Message) error {
+	var heartbeat struct {
+		PeerID    string    `json:"peer_id"`
+		Timestamp time.Time `json:"timestamp"`
+		Status    string    `json:"status"`
+	}
+	if err := mapToStruct(msg.Payload, &heartbeat); err != nil {
+		return fmt.Errorf("failed to parse heartbeat: %w", err)
 	}
 
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(msg); err != nil {
-		return fmt.Errorf("failed to encode sync response: %w", err)
-	}
-	return nil
-}
-
-// handleSyncRequest processes an incoming sync request
-func (ph *ProtocolHandler) handleSyncRequest(conn io.Writer, payload map[string]any) error {
-	repoName, ok := payload["repository"].(string)
-	if !ok {
-		return ph.SendSyncResponseMessage(conn, false, "invalid repository name in request")
-	}
-
-	// Open or initialize the repository
-	repo, err := ph.gitManager.OpenRepository(repoName)
-	if err != nil {
-		return ph.SendSyncResponseMessage(conn, false, fmt.Sprintf("failed to open repository: %v", err))
-	}
-
-	// Try to fetch updates
-	err = ph.gitManager.FetchRepository(context.Background(), repo)
-	if err != nil {
-		return ph.SendSyncResponseMessage(conn, false, fmt.Sprintf("failed to fetch repository: %v", err))
-	}
-
-	// Get the HEAD reference
-	headRef, err := ph.gitManager.GetHeadReference(repo)
-	if err != nil {
-		return ph.SendSyncResponseMessage(conn, false, fmt.Sprintf("failed to get HEAD reference: %v", err))
-	}
-
-	return ph.SendSyncResponseMessage(conn, true, fmt.Sprintf("synchronized repository %s at commit %s", repoName, headRef.Hash()))
-}
-
-// handleSyncResponse processes an incoming sync response
-func (ph *ProtocolHandler) handleSyncResponse(payload map[string]any) error {
-	success, _ := payload["success"].(bool)
-	message, _ := payload["message"].(string)
-
-	fmt.Printf("Received sync response: success=%v, message='%s'\n", success, message)
-	return nil
-}
-
-// New message handling methods
-func (ph *ProtocolHandler) handlePeerAnnounce(payload map[string]any) error {
-	var announce PeerAnnounceMessage
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
-	if err := json.Unmarshal(data, &announce); err != nil {
-		return fmt.Errorf("failed to unmarshal peer announce: %w", err)
-	}
-
-	if ph.onPeerAnnounce != nil {
-		ph.onPeerAnnounce(announce.PeerInfo)
-	}
-	return nil
-}
-
-func (ph *ProtocolHandler) handlePeerListRequest(conn io.Writer) error {
-	var peers []model.PeerInfo
-	if ph.onPeerListRequest != nil {
-		peers = ph.onPeerListRequest()
-	}
-
-	response := Message{
-		Type: PeerListResponse,
-		Payload: map[string]any{
-			"peers": peers,
-		},
-	}
-
-	encoder := json.NewEncoder(conn)
-	return encoder.Encode(response)
-}
-
-func (ph *ProtocolHandler) handleHeartbeat(payload map[string]any) error {
-	var heartbeat HeartbeatMessage
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %w", err)
-	}
-
-	if err := json.Unmarshal(data, &heartbeat); err != nil {
-		return fmt.Errorf("failed to unmarshal heartbeat: %w", err)
-	}
-
+	// Call heartbeat handler if registered
 	if ph.onHeartbeat != nil {
-		ph.onHeartbeat(heartbeat.PeerID, heartbeat.TimeStamp)
+		ph.onHeartbeat(heartbeat.PeerID, heartbeat.Timestamp)
 	}
+
 	return nil
 }
 
-func (ph *ProtocolHandler) handleRepoStateRequest(conn io.Writer, payload map[string]any) error {
-	repoName, ok := payload["repository"].(string)
-	if !ok {
-		return fmt.Errorf("invalid repository name in request")
-	}
+// SendSyncRequestMessage sends a sync request for a specific repository
+func (ph *ProtocolHandler) SendSyncRequestMessage(conn net.Conn, repoName string) error {
+	return ph.SendMessage(conn, SyncRequest, map[string]interface{}{
+		"repository": repoName,
+		"timestamp":  time.Now(),
+	})
+}
 
-	if ph.onRepoStateRequest == nil {
-		return fmt.Errorf("no repo state request handler configured")
-	}
+// SendHeartbeat sends a heartbeat message
+func (ph *ProtocolHandler) SendHeartbeat(conn net.Conn, messageType string) error {
+	return ph.SendMessage(conn, Heartbeat, map[string]interface{}{
+		"type":      messageType,
+		"timestamp": time.Now(),
+	})
+}
 
-	state, err := ph.onRepoStateRequest(repoName)
+// SendFile initiates a file transfer to a peer
+func (ph *ProtocolHandler) SendFile(conn net.Conn, filePath string) error {
+	// Open and stat the file
+	file, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat file: %w", err)
 	}
 
-	response := Message{
-		Type: RepoStateAdvertise,
-		Payload: map[string]any{
-			"state": state,
+	// Create a new transfer session
+	sessionID := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d", filePath, time.Now().UnixNano()))))
+	session := &TransferSession{
+		ID:                sessionID,
+		FilePath:          filePath,
+		FileSize:          fileInfo.Size(),
+		ChunkSize:         1 << 16, // 64KB chunks
+		ReceivedChunks:    make(map[int][]byte),
+		VerifiedChunks:    make(map[int]bool),
+		OutstandingChunks: make(map[int64]time.Time),
+		Stats: &TransferStats{
+			StartTime:  time.Now(),
+			BytesTotal: fileInfo.Size(),
 		},
+		LastActivity: time.Now(),
 	}
 
-	return json.NewEncoder(conn).Encode(response)
-}
+	ph.transfersMu.Lock()
+	ph.activeTransfers[sessionID] = session
+	ph.transfersMu.Unlock()
 
-func (ph *ProtocolHandler) handleRepoStateAdvertise(payload map[string]any) error {
-	var state RepositoryState
-	data, err := json.Marshal(payload["state"])
-	if err != nil {
-		return fmt.Errorf("failed to marshal state data: %w", err)
-	}
+	// Calculate number of chunks
+	numChunks := int((fileInfo.Size() + session.ChunkSize - 1) / session.ChunkSize)
 
-	if err := json.Unmarshal(data, &state); err != nil {
-		return fmt.Errorf("failed to unmarshal repository state: %w", err)
-	}
+	// Send file chunks
+	buffer := make([]byte, session.ChunkSize)
+	for i := 0; i < numChunks; i++ {
+		n, err := file.Read(buffer)
+		if err != nil {
+			return fmt.Errorf("failed to read file chunk: %w", err)
+		}
 
-	// Process the repository state
-	// Compare with local state and initiate sync if needed
-	return nil
-}
+		// Calculate chunk hash
+		hasher := sha256.New()
+		hasher.Write(buffer[:n])
+		hash := hex.EncodeToString(hasher.Sum(nil))
 
-func (ph *ProtocolHandler) handleBranchSyncRequest(conn io.Writer, payload map[string]any) error {
-	var syncInfo BranchSyncInfo
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal sync info: %w", err)
-	}
+		chunk := &FileChunk{
+			SessionID: sessionID,
+			Offset:    int64(i) * session.ChunkSize,
+			Data:      buffer[:n],
+			Hash:      hash,
+			Total:     fileInfo.Size(),
+			Index:     i,
+			Count:     numChunks,
+		}
 
-	if err := json.Unmarshal(data, &syncInfo); err != nil {
-		return fmt.Errorf("failed to unmarshal branch sync info: %w", err)
-	}
+		if err := ph.SendFileChunk(conn, chunk); err != nil {
+			return fmt.Errorf("failed to send file chunk: %w", err)
+		}
 
-	if ph.onBranchSyncRequest != nil {
-		if err := ph.onBranchSyncRequest(syncInfo); err != nil {
-			return err
+		session.mu.Lock()
+		session.Stats.BytesSent += int64(n)
+		session.OutstandingChunks[chunk.Offset] = time.Now()
+		session.mu.Unlock()
+
+		// Let the bandwidth manager control the send rate
+		if ph.bandwidthMgr != nil {
+			if err := ph.bandwidthMgr.AcquireBandwidth(sessionID, int64(n)); err != nil {
+				return fmt.Errorf("bandwidth limit exceeded: %w", err)
+			}
 		}
 	}
 
-	response := Message{
-		Type: BranchSyncResponse,
-		Payload: map[string]any{
-			"success": true,
-			"branch":  syncInfo.BranchName,
-		},
-	}
-
-	return json.NewEncoder(conn).Encode(response)
+	// Send transfer complete message
+	return ph.SendMessage(conn, TransferComplete, map[string]interface{}{
+		"session_id": sessionID,
+		"file_path":  filePath,
+		"size":       fileInfo.Size(),
+		"chunks":     numChunks,
+	})
 }
 
-func (ph *ProtocolHandler) handleConflictNotification(payload map[string]any) error {
-	var conflictInfo ConflictInfo
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("failed to marshal conflict info: %w", err)
-	}
-
-	if err := json.Unmarshal(data, &conflictInfo); err != nil {
-		return fmt.Errorf("failed to unmarshal conflict info: %w", err)
-	}
-
-	if ph.onConflictNotification != nil {
-		return ph.onConflictNotification(conflictInfo)
-	}
-	return nil
+// Handler setter methods
+func (ph *ProtocolHandler) SetPeerAnnounceHandler(handler func(*model.PeerInfo)) {
+	ph.onPeerAnnounce = handler
 }
 
-func (ph *ProtocolHandler) handleCapabilityExchange(conn io.Writer, payload map[string]any) error {
-	var peerCapabilities PeerCapabilities
-	data, err := json.Marshal(payload)
+func (ph *ProtocolHandler) SetPeerListRequestHandler(handler func() []model.PeerInfo) {
+	ph.onPeerListRequest = handler
+}
+
+func (ph *ProtocolHandler) SetMetadataUpdateHandler(handler func(string, *model.SyncMetrics)) {
+	ph.onMetadataUpdate = handler
+}
+
+func (ph *ProtocolHandler) SetConsensusHandlers(
+	proposeHandler func(*model.SyncProposal) (*model.SyncVote, error),
+	voteHandler func(*model.SyncVote) error,
+	commitHandler func(*model.SyncCommit) error,
+) {
+	ph.onConsensusPropose = proposeHandler
+	ph.onConsensusVote = voteHandler
+	ph.onConsensusCommit = commitHandler
+}
+
+// Helper function to convert map to struct
+func mapToStruct(m map[string]interface{}, val interface{}) error {
+	jsonBytes, err := json.Marshal(m)
 	if err != nil {
-		return fmt.Errorf("failed to marshal capabilities: %w", err)
+		return err
 	}
-
-	if err := json.Unmarshal(data, &peerCapabilities); err != nil {
-		return fmt.Errorf("failed to unmarshal capabilities: %w", err)
-	}
-
-	// Send our capabilities in response
-	response := Message{
-		Type: CapabilityExchange,
-		Payload: map[string]any{
-			"capabilities": ph.capabilities,
-		},
-	}
-
-	return json.NewEncoder(conn).Encode(response)
+	return json.Unmarshal(jsonBytes, val)
 }

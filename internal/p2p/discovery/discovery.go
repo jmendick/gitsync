@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -33,6 +34,32 @@ type PeerStatistics struct {
 	AverageLatency   float64   `json:"average_latency"`
 	LastSyncTime     time.Time `json:"last_sync_time"`
 	ReliabilityScore float64   `json:"reliability_score"`
+	SharedRepos      []string  `json:"shared_repos"`
+	UpTime           float64   `json:"up_time"`
+	BandwidthScore   float64   `json:"bandwidth_score"`
+}
+
+// GetPeerScore returns a weighted score for peer selection
+func (ps *PeerStatistics) GetPeerScore() float64 {
+	if ps.SuccessfulSyncs+ps.FailedSyncs == 0 {
+		return 0.5 // Default score for new peers
+	}
+
+	// Calculate basic reliability from sync success rate
+	syncRate := float64(ps.SuccessfulSyncs) / float64(ps.SuccessfulSyncs+ps.FailedSyncs)
+
+	// Penalize high latency (normalize to 0-1 range, assuming 1000ms as max acceptable)
+	latencyScore := 1.0 - math.Min(1.0, ps.AverageLatency/1000.0)
+
+	// Factor in recency of last sync
+	recencyScore := 1.0
+	if !ps.LastSyncTime.IsZero() {
+		hoursSinceLastSync := time.Since(ps.LastSyncTime).Hours()
+		recencyScore = math.Max(0, 1.0-hoursSinceLastSync/24.0) // Decay over 24 hours
+	}
+
+	// Combine scores with weights
+	return (syncRate * 0.4) + (latencyScore * 0.3) + (recencyScore * 0.2) + (ps.UpTime * 0.1)
 }
 
 // DiscoveryService handles peer discovery.
@@ -453,6 +480,15 @@ func (ds *DiscoveryService) GetPeerInfo(peerID string) (*model.PeerInfo, bool) {
 	return peer.Info, true
 }
 
+// GetPeerByID returns a peer's info by their ID
+func (ds *DiscoveryService) GetPeerByID(peerID string) *model.PeerInfo {
+	info, exists := ds.GetPeerInfo(peerID)
+	if !exists {
+		return nil
+	}
+	return info
+}
+
 // Helper methods
 
 func (ds *DiscoveryService) calculateZone(addr string) string {
@@ -481,7 +517,7 @@ func (ds *DiscoveryService) sendHeartbeat(addr string) error {
 	return json.NewEncoder(conn).Encode(heartbeat)
 }
 
-// UpdatePeerStatistics updates the statistics for a peer
+// UpdatePeerStatistics updates statistics for a peer
 func (ds *DiscoveryService) UpdatePeerStatistics(peerID string, syncSuccess bool, latency time.Duration) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
@@ -493,21 +529,53 @@ func (ds *DiscoveryService) UpdatePeerStatistics(peerID string, syncSuccess bool
 			peer.Statistics.FailedSyncs++
 		}
 
-		// Update average latency
+		// Update average latency with exponential moving average
+		alpha := 0.2 // Smoothing factor
 		if peer.Statistics.AverageLatency == 0 {
 			peer.Statistics.AverageLatency = float64(latency.Milliseconds())
 		} else {
-			peer.Statistics.AverageLatency = (peer.Statistics.AverageLatency + float64(latency.Milliseconds())) / 2
+			peer.Statistics.AverageLatency = (alpha * float64(latency.Milliseconds())) +
+				((1 - alpha) * peer.Statistics.AverageLatency)
 		}
 
 		peer.Statistics.LastSyncTime = time.Now()
+		peer.Statistics.ReliabilityScore = peer.Statistics.GetPeerScore()
 
-		// Calculate reliability score (example formula)
-		totalSyncs := float64(peer.Statistics.SuccessfulSyncs + peer.Statistics.FailedSyncs)
-		if totalSyncs > 0 {
-			peer.Statistics.ReliabilityScore = float64(peer.Statistics.SuccessfulSyncs) / totalSyncs
-		}
+		// Update uptime based on heartbeat history
+		peer.Statistics.UpTime = ds.calculatePeerUptime(peerID)
+
+		// Calculate bandwidth score based on recent transfers
+		peer.Statistics.BandwidthScore = ds.calculateBandwidthScore(peerID)
 	}
+}
+
+// calculatePeerUptime calculates the peer's uptime ratio
+func (ds *DiscoveryService) calculatePeerUptime(peerID string) float64 {
+	peer, exists := ds.peers[peerID]
+	if !exists {
+		return 0
+	}
+
+	if peer.FirstSeen.IsZero() {
+		return 1.0 // New peer
+	}
+
+	totalTime := time.Since(peer.FirstSeen)
+	activeTime := totalTime - peer.Statistics.getDowntime()
+
+	return float64(activeTime) / float64(totalTime)
+}
+
+// calculateBandwidthScore calculates a score based on transfer speeds
+func (ds *DiscoveryService) calculateBandwidthScore(peerID string) float64 {
+	// TODO: Implement bandwidth tracking
+	return 1.0
+}
+
+// getDowntime returns the total downtime for a peer
+func (ps *PeerStatistics) getDowntime() time.Duration {
+	// TODO: Implement downtime tracking based on missed heartbeats
+	return 0
 }
 
 // GetPeerStatistics returns the statistics for a specific peer

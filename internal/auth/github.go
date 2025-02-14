@@ -11,18 +11,18 @@ import (
 	"golang.org/x/oauth2/github"
 )
 
-type GitHubOAuth struct {
-	config   *oauth2.Config
-	store    UserStore
-	tokenMgr *TokenManager
-	states   *stateStore
-}
-
 type githubUser struct {
 	Login string `json:"login"`
 	Email string `json:"email"`
 	Name  string `json:"name"`
 	ID    int64  `json:"id"`
+}
+
+type GitHubOAuth struct {
+	config   *oauth2.Config
+	store    UserStore
+	tokenMgr *TokenManager
+	states   *stateStore
 }
 
 func NewGitHubOAuth(clientID, clientSecret, callbackURL string, store UserStore, tokenMgr *TokenManager) *GitHubOAuth {
@@ -42,7 +42,7 @@ func NewGitHubOAuth(clientID, clientSecret, callbackURL string, store UserStore,
 
 func (gh *GitHubOAuth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	state, err := gh.states.Generate()
-	if err != nil {
+	if (err != nil) {
 		http.Error(w, "Failed to generate state token", http.StatusInternalServerError)
 		return
 	}

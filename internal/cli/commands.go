@@ -15,6 +15,7 @@ import (
 	"github.com/jmendick/gitsync/internal/config"
 	"github.com/jmendick/gitsync/internal/git"
 	"github.com/jmendick/gitsync/internal/p2p"
+	"github.com/jmendick/gitsync/internal/p2p/bandwidth"
 	"github.com/jmendick/gitsync/internal/p2p/protocol"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -174,8 +175,18 @@ var peersCmd = &cobra.Command{
 			return fmt.Errorf("failed to load config: %w", err)
 		}
 
-		// Create a temporary P2P node to discover peers
-		protocolHandler := protocol.NewProtocolHandler(nil) // Temporary nil since we don't need git operations
+		userStore, err := auth.NewFileUserStore(filepath.Join(cfg.GetConfigDir(), "users.json"))
+		if err != nil {
+			return fmt.Errorf("failed to initialize user store: %w", err)
+		}
+
+		gitMgr := git.NewGitRepositoryManager(cfg.GetRepositoryDir(), userStore)
+
+		// Initialize bandwidth manager
+		bandwidthMgr := bandwidth.NewManager(cfg.Network.BandwidthLimit)
+
+		protocolHandler := protocol.NewProtocolHandler(gitMgr, bandwidthMgr)
+
 		node, err := p2p.NewNode(cfg, protocolHandler)
 		if err != nil {
 			return fmt.Errorf("failed to initialize P2P node: %w", err)
@@ -513,19 +524,10 @@ var loginCmd = &cobra.Command{
 	},
 }
 
-// Execute adds all child commands to the root command and sets flags appropriately.
 func Execute() error {
 	// Add config subcommands
 	configCmd.AddCommand(configGetCmd)
 	configCmd.AddCommand(configSetCmd)
-
-	// Add all commands to root
-	rootCmd.AddCommand(initCmd)
-	rootCmd.AddCommand(shareCmd)
-	rootCmd.AddCommand(syncCmd)
-	rootCmd.AddCommand(peersCmd)
-	rootCmd.AddCommand(statusCmd)
-	rootCmd.AddCommand(configCmd)
 	return rootCmd.Execute()
 }
 
@@ -543,19 +545,17 @@ func init() {
 		log.Printf("Warning: Failed to initialize user store: %v\n", err)
 	}
 
-	// Add user management commands if user store was initialized successfully
-	if userStore != nil {
-		rootCmd.AddCommand(AddUserCommand(userStore))
-	}
-
-	// Add login command
-	rootCmd.AddCommand(loginCmd)
-
-	// Add all commands to root
+	// Add commands to root command
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(shareCmd)
 	rootCmd.AddCommand(syncCmd)
 	rootCmd.AddCommand(peersCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(loginCmd)
+
+	// Add user management commands only if user store was initialized successfully
+	if userStore != nil {
+		rootCmd.AddCommand(AddUserCommand(userStore))
+	}
 }

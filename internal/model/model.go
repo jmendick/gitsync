@@ -1,10 +1,34 @@
 package model
 
+import (
+	"time"
+)
+
+// PeerConnectionQuality represents connection quality metrics
+type PeerConnectionQuality struct {
+	Latency          time.Duration `json:"latency"`
+	PacketLoss       float64       `json:"packet_loss"`
+	Bandwidth        float64       `json:"bandwidth"`
+	ReliabilityScore float64       `json:"reliability_score"`
+}
+
+// PeerSyncStats represents peer sync statistics
+type PeerSyncStats struct {
+	SuccessfulSyncs int       `json:"successful_syncs"`
+	FailedSyncs     int       `json:"failed_syncs"`
+	LastSyncTime    time.Time `json:"last_sync_time"`
+	AverageLatency  float64   `json:"average_latency"`
+	TotalBytes      int64     `json:"total_bytes"`
+}
+
 // PeerInfo represents information about a peer in the P2P network.
 type PeerInfo struct {
-	ID        string   `json:"id"`        // Unique Peer ID
-	Addresses []string `json:"addresses"` // Network addresses of the peer
-	// ... other peer related information ...
+	ID                string                 `json:"id"`        // Unique Peer ID
+	Addresses         []string               `json:"addresses"` // Network addresses of the peer
+	ConnectionQuality *PeerConnectionQuality `json:"connection_quality,omitempty"`
+	SyncStats         *PeerSyncStats         `json:"sync_stats,omitempty"`
+	LastSeen          time.Time              `json:"last_seen"`
+	Features          []string               `json:"features,omitempty"`
 }
 
 // RepositoryMetadata represents metadata about a synchronized repository.
@@ -45,4 +69,40 @@ type Lock struct {
 	LockID     string `json:"lock_id"`
 }
 
-// ... (Define more data models as needed for your application) ...
+// SyncOperation represents a synchronization operation
+type SyncOperation struct {
+	ID           string    `json:"id"`
+	RepositoryID string    `json:"repository_id"`
+	StartTime    time.Time `json:"start_time"`
+	EndTime      time.Time `json:"end_time,omitempty"`
+	Status       string    `json:"status"` // pending, running, completed, failed
+	ErrorMessage string    `json:"error_message,omitempty"`
+	Progress     float64   `json:"progress"`
+	Strategy     string    `json:"strategy"`
+	PeerID       string    `json:"peer_id"`
+}
+
+// SyncMetrics contains metrics about sync operations
+type SyncMetrics struct {
+	TotalBytes        int64         `json:"total_bytes"`
+	TransferredBytes  int64         `json:"transferred_bytes"`
+	TransferRate      float64       `json:"transfer_rate"`
+	ConflictsFound    int           `json:"conflicts_found"`
+	ConflictsResolved int           `json:"conflicts_resolved"`
+	Duration          time.Duration `json:"duration"`
+}
+
+// ProgressReporter defines the interface for reporting progress
+type ProgressReporter interface {
+	UpdateProgress(operation *SyncOperation)
+	OnComplete(operation *SyncOperation, metrics *SyncMetrics)
+	OnError(operation *SyncOperation, err error)
+}
+
+// SyncResult contains the result of a sync operation
+type SyncResult struct {
+	Operation *SyncOperation `json:"operation"`
+	Metrics   *SyncMetrics   `json:"metrics"`
+	Changes   []string       `json:"changes"`
+	Conflicts []*Conflict    `json:"conflicts"`
+}

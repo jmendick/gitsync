@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -13,6 +14,23 @@ import (
 	"github.com/jmendick/gitsync/internal/p2p/protocol"
 )
 
+// ConnectionQuality represents connection quality metrics
+type ConnectionQuality struct {
+	Latency      time.Duration
+	PacketLoss   float64
+	Bandwidth    float64 // bytes per second
+	RTTVariation float64
+	LastMeasured time.Time
+}
+
+// BandwidthManager manages connection bandwidth
+type BandwidthManager struct {
+	maxBandwidth int64 // bytes per second
+	currentUsage int64
+	connections  map[string]*ConnectionQuality
+	mu           sync.RWMutex
+}
+
 // Node represents the P2P node.
 type Node struct {
 	config          *config.Config
@@ -22,6 +40,9 @@ type Node struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
+	bandwidthMgr    *BandwidthManager
+	connQuality     map[string]*ConnectionQuality
+	connQualityMu   sync.RWMutex
 }
 
 // NewNode creates a new P2P node.
@@ -38,19 +59,27 @@ func NewNode(cfg *config.Config, protocolHandler *protocol.ProtocolHandler) (*No
 		return nil, fmt.Errorf("failed to initialize discovery service: %w", err)
 	}
 
+	bandwidthMgr := &BandwidthManager{
+		maxBandwidth: cfg.Network.BandwidthLimit,
+		connections:  make(map[string]*ConnectionQuality),
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	node := &Node{
 		config:          cfg,
 		listener:        listener,
 		peerDiscovery:   discService,
 		protocolHandler: protocolHandler,
+		bandwidthMgr:    bandwidthMgr,
+		connQuality:     make(map[string]*ConnectionQuality),
 		ctx:             ctx,
 		cancel:          cancel,
 	}
 
-	node.wg.Add(2)
+	node.wg.Add(3)
 	go node.startPeerDiscovery()
 	go node.startListening()
+	go node.startQualityMonitoring()
 
 	return node, nil
 }
@@ -161,4 +190,160 @@ func (n *Node) SendSyncRequest(ctx context.Context, peerInfo *model.PeerInfo, re
 // GetPeerDiscovery returns the peer discovery service.
 func (n *Node) GetPeerDiscovery() *discovery.DiscoveryService {
 	return n.peerDiscovery
+}
+
+func (n *Node) startQualityMonitoring() {
+	defer n.wg.Done()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-ticker.C:
+			n.updateConnectionQualities()
+		}
+	}
+}
+
+func (n *Node) updateConnectionQualities() {
+	n.connQualityMu.Lock()
+	defer n.connQualityMu.Unlock()
+
+	for peerID, quality := range n.connQuality {
+		if time.Since(quality.LastMeasured) > 5*time.Minute {
+			// Connection might be stale, measure quality
+			if newQuality, err := n.measureConnectionQuality(peerID); err == nil {
+				n.connQuality[peerID] = newQuality
+			} else {
+				// Connection might be dead
+				delete(n.connQuality, peerID)
+			}
+		}
+	}
+}
+
+func (n *Node) measureConnectionQuality(peerID string) (*ConnectionQuality, error) {
+	peer := n.peerDiscovery.GetPeerByID(peerID)
+	if peer == nil {
+		return nil, fmt.Errorf("peer not found")
+	}
+
+	quality := &ConnectionQuality{
+		LastMeasured: time.Now(),
+	}
+
+	// Measure RTT and packet loss
+	rttSum := time.Duration(0)
+	rttSamples := make([]time.Duration, 0, 5)
+	packetsSent := 0
+	packetsReceived := 0
+
+	for i := 0; i < 5; i++ {
+		start := time.Now()
+		if err := n.sendPing(peer); err != nil {
+			packetsSent++
+			continue
+		}
+		rtt := time.Since(start)
+		rttSum += rtt
+		rttSamples = append(rttSamples, rtt)
+		packetsSent++
+		packetsReceived++
+	}
+
+	if packetsReceived == 0 {
+		return nil, fmt.Errorf("no response from peer")
+	}
+
+	quality.Latency = rttSum / time.Duration(packetsReceived)
+	quality.PacketLoss = 1 - (float64(packetsReceived) / float64(packetsSent))
+
+	// Calculate RTT variation
+	if len(rttSamples) > 1 {
+		mean := float64(quality.Latency)
+		var variance float64
+		for _, rtt := range rttSamples {
+			diff := float64(rtt) - mean
+			variance += diff * diff
+		}
+		quality.RTTVariation = math.Sqrt(variance / float64(len(rttSamples)-1))
+	}
+
+	// Measure available bandwidth
+	bandwidth, err := n.measureBandwidth(peer)
+	if err != nil {
+		fmt.Printf("Warning: Failed to measure bandwidth for peer %s: %v\n", peerID, err)
+	} else {
+		quality.Bandwidth = bandwidth
+	}
+
+	return quality, nil
+}
+
+func (n *Node) measureBandwidth(peer *model.PeerInfo) (float64, error) {
+	// Implement bandwidth measurement
+	// This could involve sending/receiving test data and measuring throughput
+	// For now, return a placeholder implementation
+	return 1000000, nil // 1 MB/s placeholder
+}
+
+func (n *Node) sendPing(peer *model.PeerInfo) error {
+	// Try each address until one succeeds
+	for _, addr := range peer.Addresses {
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			continue
+		}
+		defer conn.Close()
+
+		// Send ping message
+		err = n.protocolHandler.SendHeartbeat(conn, "ping")
+		if err != nil {
+			continue
+		}
+
+		return nil
+	}
+	return fmt.Errorf("failed to ping peer at any address")
+}
+
+func (n *Node) GetConnectionQuality(peerID string) *ConnectionQuality {
+	n.connQualityMu.RLock()
+	defer n.connQualityMu.RUnlock()
+	return n.connQuality[peerID]
+}
+
+// ConnectToPeer establishes a connection to a peer
+func (n *Node) ConnectToPeer(peer *model.PeerInfo) (net.Conn, error) {
+	for _, addr := range peer.Addresses {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			continue
+		}
+		return conn, nil
+	}
+	return nil, fmt.Errorf("failed to connect to peer %s at any address", peer.ID)
+}
+
+// ProtocolHandler returns the node's protocol handler
+func (n *Node) ProtocolHandler() *protocol.ProtocolHandler {
+	return n.protocolHandler
+}
+
+// Add file transfer functionality
+func (n *Node) SendFile(ctx context.Context, peerID string, filePath string) error {
+	peer := n.peerDiscovery.GetPeerByID(peerID)
+	if peer == nil {
+		return fmt.Errorf("peer %s not found", peerID)
+	}
+
+	conn, err := n.ConnectToPeer(peer)
+	if err != nil {
+		return fmt.Errorf("failed to connect to peer: %w", err)
+	}
+	defer conn.Close()
+
+	return n.protocolHandler.SendFile(conn, filePath)
 }

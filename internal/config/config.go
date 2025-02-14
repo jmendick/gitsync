@@ -70,6 +70,30 @@ type SyncConfig struct {
 	ExcludePatterns  []string      `yaml:"exclude_patterns,omitempty"`
 	IncludePatterns  []string      `yaml:"include_patterns,omitempty"`
 	BatchSize        int           `yaml:"batch_size"` // number of files to sync in one batch
+
+	// Minimum number of successful peer syncs required
+	MinSuccessfulPeers int `yaml:"min_successful_peers"`
+
+	// Maximum concurrent sync operations
+	MaxConcurrentSyncs int `yaml:"max_concurrent_syncs"`
+
+	// Conflict resolution settings
+	ConflictVoteTimeout time.Duration `yaml:"conflict_vote_timeout"`
+
+	// Batch transfer settings
+	InitialBatchSize  int64 `yaml:"initial_batch_size"`
+	MinBatchSize      int64 `yaml:"min_batch_size"`
+	MaxBatchSize      int64 `yaml:"max_batch_size"`
+	BatchSizeAdaptive bool  `yaml:"batch_size_adaptive"`
+
+	// Transfer retry settings
+	MaxRetries       int           `yaml:"max_retries"`
+	RetryBackoffBase time.Duration `yaml:"retry_backoff_base"`
+
+	// Bandwidth management
+	MaxBandwidthPerPeer  int64 `yaml:"max_bandwidth_per_peer"`
+	GlobalBandwidthLimit int64 `yaml:"global_bandwidth_limit"`
+	EnableCongestionCtrl bool  `yaml:"enable_congestion_ctrl"`
 }
 
 // MergeConfig defines merge preferences
@@ -148,12 +172,24 @@ func LoadConfig() (*Config, error) {
 
 		// Default sync settings
 		Sync: SyncConfig{
-			SyncInterval:     5 * time.Minute,
-			MaxSyncAttempts:  3,
-			SyncMode:         "incremental",
-			ConflictStrategy: "manual",
-			AutoSyncEnabled:  true,
-			BatchSize:        100,
+			SyncInterval:         5 * time.Minute,
+			MaxSyncAttempts:      3,
+			SyncMode:             "incremental",
+			ConflictStrategy:     "manual",
+			AutoSyncEnabled:      true,
+			BatchSize:            100,
+			MinSuccessfulPeers:   1,
+			MaxConcurrentSyncs:   5,
+			ConflictVoteTimeout:  30 * time.Second,
+			InitialBatchSize:     64 * 1024,   // 64KB
+			MinBatchSize:         1024,        // 1KB
+			MaxBatchSize:         1024 * 1024, // 1MB
+			BatchSizeAdaptive:    true,
+			MaxRetries:           3,
+			RetryBackoffBase:     time.Second,
+			MaxBandwidthPerPeer:  1024 * 1024,      // 1MB/s
+			GlobalBandwidthLimit: 10 * 1024 * 1024, // 10MB/s
+			EnableCongestionCtrl: true,
 		},
 
 		// Default merge settings
@@ -234,12 +270,24 @@ func LoadConfigFromFile(configPath string) (*Config, error) {
 
 		// Default sync settings
 		Sync: SyncConfig{
-			SyncInterval:     5 * time.Minute,
-			MaxSyncAttempts:  3,
-			SyncMode:         "incremental",
-			ConflictStrategy: "manual",
-			AutoSyncEnabled:  true,
-			BatchSize:        100,
+			SyncInterval:         5 * time.Minute,
+			MaxSyncAttempts:      3,
+			SyncMode:             "incremental",
+			ConflictStrategy:     "manual",
+			AutoSyncEnabled:      true,
+			BatchSize:            100,
+			MinSuccessfulPeers:   1,
+			MaxConcurrentSyncs:   5,
+			ConflictVoteTimeout:  30 * time.Second,
+			InitialBatchSize:     64 * 1024,   // 64KB
+			MinBatchSize:         1024,        // 1KB
+			MaxBatchSize:         1024 * 1024, // 1MB
+			BatchSizeAdaptive:    true,
+			MaxRetries:           3,
+			RetryBackoffBase:     time.Second,
+			MaxBandwidthPerPeer:  1024 * 1024,      // 1MB/s
+			GlobalBandwidthLimit: 10 * 1024 * 1024, // 10MB/s
+			EnableCongestionCtrl: true,
 		},
 
 		// Default merge settings
